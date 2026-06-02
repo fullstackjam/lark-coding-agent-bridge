@@ -65,6 +65,16 @@ export interface AgentRun {
   waitForExit(timeoutMs: number): Promise<boolean>;
 }
 
+/**
+ * The bridge bot's own IM identity, resolved by the channel after the WS
+ * handshake (`/open-apis/bot/v3/info`). Injected into adapters so the agent
+ * system prompt can state "this open_id is you" with the real value.
+ */
+export interface AgentBotIdentity {
+  openId: string;
+  name?: string;
+}
+
 export interface AgentAdapter {
   readonly id: string;
   readonly displayName: string;
@@ -72,4 +82,10 @@ export interface AgentAdapter {
   checkAvailability?(): Promise<AgentAvailability>;
   prepareRun?(opts: AgentRunOptions): Promise<void>;
   run(opts: AgentRunOptions): AgentRun;
+  /**
+   * Late-bound identity injection: the adapter is constructed before the
+   * channel connects, so the channel calls this once botIdentity is known.
+   * Adapters that don't bake identity into their prompts may omit it.
+   */
+  setBotIdentity?(identity: AgentBotIdentity): void;
 }

@@ -99,6 +99,21 @@ describe('comment run flow', () => {
     expect(h.agent.runOptions[2]?.threadId).toBe('thread-two');
   });
 
+  it('keeps Codex pre-tool progress text out of every comment reply', async () => {
+    const h = await createHarness({
+      agentKind: 'codex',
+      agentEventRuns: [
+        codexRunWithProgress('thread-one', '我先读取文档再处理。', 'first final'),
+        codexRunWithProgress('thread-two', '我继续读取上下文。', 'second final'),
+      ],
+    });
+
+    await handleCommentMention(h.deps(event({ commentId: 'comment-1', replyId: 'reply-1' })));
+    await handleCommentMention(h.deps(event({ commentId: 'comment-1', replyId: 'reply-1' })));
+
+    expect(h.inThreadReplies).toEqual(['first final', 'second final']);
+  });
+
   it('does not reuse an existing Codex thread while another document comment run is active', async () => {
     const h = await createBlockingHarness({
       agentKind: 'codex',
@@ -176,6 +191,7 @@ describe('comment run flow', () => {
 async function createHarness(options: {
   agentKind?: 'claude' | 'codex';
   agentTexts?: string[];
+  agentEventRuns?: AgentEvent[][];
   sessionIds?: string[];
   threadIds?: string[];
   reactionFails?: boolean;
@@ -198,23 +214,25 @@ async function createHarness(options: {
   const agentTexts = options.agentTexts ?? ['answer one'];
   const sessionIds = options.sessionIds ?? ['session-one'];
   const threadIds = options.threadIds ?? ['thread-one'];
-  const eventRuns: AgentEvent[][] = agentTexts.map((text, index) => [
-    {
-      type: 'system',
-      ...(agentKind === 'codex'
-        ? { threadId: threadIds[index] ?? `thread-${index}` }
-        : { sessionId: sessionIds[index] ?? `session-${index}` }),
-      cwd: tmp.workspace,
-    },
-    { type: 'text', delta: text },
-    {
-      type: 'done',
-      ...(agentKind === 'codex'
-        ? { threadId: threadIds[index] ?? `thread-${index}` }
-        : { sessionId: sessionIds[index] ?? `session-${index}` }),
-      terminationReason: 'normal',
-    },
-  ]);
+  const eventRuns: AgentEvent[][] =
+    options.agentEventRuns ??
+    agentTexts.map((text, index) => [
+      {
+        type: 'system',
+        ...(agentKind === 'codex'
+          ? { threadId: threadIds[index] ?? `thread-${index}` }
+          : { sessionId: sessionIds[index] ?? `session-${index}` }),
+        cwd: tmp.workspace,
+      },
+      { type: 'text', delta: text },
+      {
+        type: 'done',
+        ...(agentKind === 'codex'
+          ? { threadId: threadIds[index] ?? `thread-${index}` }
+          : { sessionId: sessionIds[index] ?? `session-${index}` }),
+        terminationReason: 'normal',
+      },
+    ]);
   const agent = new FakeAgentAdapter({ events: eventRuns });
   const channel: FakeCommentChannel = {
     requests,
@@ -504,6 +522,22 @@ function profile(defaultWorkspace: string, agentKind: 'claude' | 'codex' = 'clau
   });
   config.workspaces.default = defaultWorkspace;
   return config;
+}
+
+function codexRunWithProgress(threadId: string, progress: string, finalAnswer: string): AgentEvent[] {
+  return [
+    { type: 'system', threadId },
+    { type: 'text', delta: progress },
+    {
+      type: 'tool_use',
+      id: `${threadId}-tool`,
+      name: 'command_execution',
+      input: { command: 'lark-cli docs +fetch --api-version v2 --doc doc-token --doc-format markdown' },
+    },
+    { type: 'tool_result', id: `${threadId}-tool`, output: 'doc body', isError: false },
+    { type: 'text', delta: finalAnswer },
+    { type: 'done', threadId, terminationReason: 'normal' },
+  ];
 }
 
 function docSessionScope(fileToken: string): string {

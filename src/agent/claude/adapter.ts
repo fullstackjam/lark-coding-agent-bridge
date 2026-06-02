@@ -2,12 +2,13 @@ import { createInterface } from 'node:readline';
 import type { Readable } from 'node:stream';
 import { log } from '../../core/logger';
 import { mergeProcessEnv, spawnProcess, type SpawnedProcessByStdio } from '../../platform/spawn';
-import { BRIDGE_SYSTEM_PROMPT } from '../bridge-system-prompt';
+import { buildBridgeSystemPrompt } from '../bridge-system-prompt';
 import { buildLarkChannelEnv, type LarkChannelEnvContext } from '../lark-channel-env';
 import { checkAgentAvailability, type AgentAvailability } from '../preflight';
 import {
   CLAUDE_DEFAULT_PERMISSION_MODE,
   type AgentAdapter,
+  type AgentBotIdentity,
   type AgentEvent,
   type AgentRun,
   type AgentRunOptions,
@@ -27,10 +28,15 @@ export class ClaudeAdapter implements AgentAdapter {
 
   private readonly binary: string;
   private readonly larkChannel: LarkChannelEnvContext | undefined;
+  private botIdentity: AgentBotIdentity | undefined;
 
   constructor(opts: ClaudeAdapterOptions = {}) {
     this.binary = opts.binary ?? 'claude';
     this.larkChannel = opts.larkChannel;
+  }
+
+  setBotIdentity(identity: AgentBotIdentity): void {
+    this.botIdentity = identity;
   }
 
   async isAvailable(): Promise<boolean> {
@@ -60,7 +66,7 @@ export class ClaudeAdapter implements AgentAdapter {
       '--permission-mode',
       opts.permissionMode ?? CLAUDE_DEFAULT_PERMISSION_MODE,
       '--append-system-prompt',
-      BRIDGE_SYSTEM_PROMPT,
+      buildBridgeSystemPrompt(this.botIdentity),
     ];
     if (opts.sessionId) args.push('--resume', opts.sessionId);
     if (opts.model) args.push('--model', opts.model);

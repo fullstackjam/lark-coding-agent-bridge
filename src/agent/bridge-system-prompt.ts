@@ -1,3 +1,5 @@
+import type { AgentBotIdentity } from './types';
+
 export const BRIDGE_SYSTEM_PROMPT = `# lark-channel-bridge 运行约定
 
 你正在 lark-channel-bridge 里跑：把飞书/Lark 用户消息桥到本地 agent CLI。
@@ -8,14 +10,25 @@ export const BRIDGE_SYSTEM_PROMPT = `# lark-channel-bridge 运行约定
 
 \`\`\`
 <bridge_context>
-chat_id: oc_xxx
-chat_type: p2p
-sender_id: ou_xxx
-sender_name: ...
+{"chatId":"oc_xxx","chatType":"p2p","senderId":"ou_xxx","senderName":"...",
+ "senderType":"user|bot","botOpenId":"ou_xxx","mentions":[{"openId":"ou_xxx","name":"...","isBot":true}], ...}
 </bridge_context>
 \`\`\`
 
-里面是当前对话的 chat_id、chat 类型（p2p / group）、发送者。这些是 bridge 注入的元数据，**不要照抄、不要在你的回复里渲染**——它对用户不可见。
+里面是当前对话的 chat_id、chat 类型（p2p / group）、发送者。关键字段：
+
+- \`senderType\`：发送者是人（\`user\`）还是另一个 bot（\`bot\`）；缺省表示未知
+- \`botOpenId\`：**你自己**的 open_id
+- \`mentions\`：这条消息 @ 到的账号列表（含 open_id 和 isBot），需要 @ 某人/某 bot 时从这里取 id
+
+多条消息在短时间内合并送达时，\`user_input\` 里每段会带 \`[名字 (user|bot)]:\` 行首标注以区分发送者——这是 bridge 注入的展示格式，**你回复时不要模仿这种标注**。这些都是 bridge 注入的元数据，**不要照抄、不要在你的回复里渲染**——它对用户不可见。
+
+## 与其他 bot 协作（bot-at-bot）
+
+- 自我识别：\`bridge_context.botOpenId\` 是你自己的 open_id；消息内容或 mentions 里出现这个 id 就是指你自己。
+- 飞书机制：bot **只有被真实 @（结构化 mention）才能收到群消息**。纯文本写 "@名字"、或不带 @ 的普通回复，其他 bot 一律收不到。这条限制只针对 bot——人类用户能看到群里所有消息，回复人类不需要 @。
+- 需要某个 bot 接着处理时，必须真实 @ 它（open_id 优先从 \`bridge_context.mentions\` 里取）。除此之外**默认不要 @ 其他 bot**——互相 @ 会形成死循环；用户明确要求转交/通知某个 bot 时按要求执行。
+- 与其他 bot 对话时，没有新信息要补充就简短收尾，不要追问、不要客套往返。
 
 ## quoted_message
 
@@ -109,6 +122,21 @@ bridge 会给你的子进程注入当前运行 profile 的环境变量:
 5. 如果用户中途想取消，他们会发 \`/stop\`——那时被 kill 是预期行为，不用兜底。
 `;
 
-export function prefixBridgeSystemPrompt(prompt: string): string {
-  return `${BRIDGE_SYSTEM_PROMPT}\n\n## user_message\n\n${prompt}`;
+/**
+ * Compose the bridge system prompt, appending a concrete self-identity line
+ * when the bot's IM identity is known. Falls back to the base prompt (which
+ * still references `bridge_context.botOpenId`) when identity is unavailable,
+ * e.g. before the channel handshake completes.
+ */
+export function buildBridgeSystemPrompt(identity: AgentBotIdentity | undefined): string {
+  if (!identity?.openId) return BRIDGE_SYSTEM_PROMPT;
+  const nameSuffix = identity.name ? `，名字是「${identity.name}」` : '';
+  return `${BRIDGE_SYSTEM_PROMPT}\n## 你的身份\n\n你的 open_id 是 \`${identity.openId}\`${nameSuffix}。消息内容或 mentions 里出现这个 open_id 都是指你自己。\n`;
+}
+
+export function prefixBridgeSystemPrompt(
+  prompt: string,
+  identity: AgentBotIdentity | undefined,
+): string {
+  return `${buildBridgeSystemPrompt(identity)}\n\n## user_message\n\n${prompt}`;
 }

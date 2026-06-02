@@ -9,6 +9,7 @@ import { claudeCapability, codexCapability } from '../agent/capability';
 import {
   buildAgentPrompt,
   type BridgePromptInteractiveCard,
+  type BridgePromptMention,
   type BridgePromptQuotedMessage,
 } from '../agent/prompt';
 import type { AgentAdapter, AgentEvent } from '../agent/types';
@@ -379,6 +380,15 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   const knownChatsRefresh = startKnownChatsRefreshTimer(channel, controls);
 
   const identity = channel.botIdentity;
+  // Late-bind the bot's own IM identity into the agent adapter so the system
+  // prompt can state "this open_id is you" with the real value. Covers both
+  // initial start and credential-swap reconnects (both go through here).
+  if (identity?.openId) {
+    agent.setBotIdentity?.({
+      openId: identity.openId,
+      ...(identity.name ? { name: identity.name } : {}),
+    });
+  }
   log.info('ws', 'connected', {
     bot: identity?.name ?? 'unknown',
     openId: identity?.openId ?? '-',
@@ -666,7 +676,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     }
   }
 
-  const prompt = buildPrompt(batch, attachments, quotes);
+  const prompt = buildPrompt(batch, attachments, quotes, channel.botIdentity);
   log.info('prompt', 'built', { promptChars: prompt.length, quotes: quotes.length });
 
   // For topic groups: thread the reply so it lands in the same topic as the
@@ -994,16 +1004,32 @@ function buildPrompt(
   batch: NormalizedMessage[],
   attachments: LocalAttachment[],
   quotes: QuotedContext[] = [],
+  botIdentity?: { openId: string; name?: string },
 ): string {
   const first = batch[0];
   if (!first) return '';
 
   const fileKeys = batch.flatMap((m) => m.resources.map((r) => r.fileKey));
+  // When the debounce window merged messages (possibly from several senders —
+  // common in bot-at-bot group chats), annotate each segment with its sender
+  // so the agent can tell who said what. Single-message batches stay verbatim.
+  const annotate = batch.length > 1;
   const texts = batch
-    .map((m) => stripAttachmentRefs(m.content, fileKeys).trim())
+    .map((m) => {
+      const text = stripAttachmentRefs(m.content, fileKeys).trim();
+      if (!text) return '';
+      return annotate ? `${senderAnnotation(m)} ${text}` : text;
+    })
     .filter(Boolean);
   const userPart =
-    texts.length > 0 ? texts.join('\n\n') : attachments.length > 0 ? '请看下面的附件。' : '';
+    texts.length > 0
+      ? texts.join('\n\n')
+      : attachments.length > 0
+        ? '请看下面的附件。'
+        : '（对方发来一条没有正文的消息——通常是只 @ 了你的唤醒（ping）。请简短回应。）';
+
+  const senderType = senderTypeOf(first);
+  const mentions = mergeMentions(batch);
 
   return buildAgentPrompt({
     context: {
@@ -1011,6 +1037,9 @@ function buildPrompt(
       chatType: first.chatType,
       senderId: first.senderId,
       ...(first.senderName ? { senderName: first.senderName } : {}),
+      ...(senderType ? { senderType } : {}),
+      ...(botIdentity?.openId ? { botOpenId: botIdentity.openId } : {}),
+      ...(mentions.length > 0 ? { mentions } : {}),
       ...(first.threadId ? { threadId: first.threadId } : {}),
       messageIds: batch.map((m) => m.messageId),
       source: 'im',
@@ -1021,6 +1050,44 @@ function buildPrompt(
     interactiveCards: batch.map(toPromptInteractiveCard).filter(isDefined),
     attachments: attachments.map(toPromptAttachment),
   });
+}
+
+/**
+ * Classify the sender as human or bot from the raw Feishu event
+ * (`sender.sender_type`: 'user' = human, 'app' = bot). The normalizer drops
+ * this field, so read it off `msg.raw` (`includeRawEvent: true` above).
+ * Unknown / missing values return undefined — omit rather than guess.
+ */
+function senderTypeOf(msg: NormalizedMessage): 'user' | 'bot' | undefined {
+  const raw = msg.raw as { sender?: { sender_type?: unknown } } | undefined;
+  const senderType = raw?.sender?.sender_type;
+  if (senderType === 'user') return 'user';
+  if (senderType === 'app' || senderType === 'bot') return 'bot';
+  return undefined;
+}
+
+function senderAnnotation(msg: NormalizedMessage): string {
+  const name = msg.senderName ?? msg.senderId;
+  const type = senderTypeOf(msg);
+  return type ? `[${name} (${type})]:` : `[${name}]:`;
+}
+
+function mergeMentions(batch: NormalizedMessage[]): BridgePromptMention[] {
+  const seen = new Set<string>();
+  const out: BridgePromptMention[] = [];
+  for (const msg of batch) {
+    for (const mention of msg.mentions ?? []) {
+      const dedupeKey = mention.openId ?? `${mention.name ?? ''}:${mention.key}`;
+      if (seen.has(dedupeKey)) continue;
+      seen.add(dedupeKey);
+      out.push({
+        ...(mention.openId ? { openId: mention.openId } : {}),
+        ...(mention.name ? { name: mention.name } : {}),
+        ...(mention.isBot !== undefined ? { isBot: mention.isBot } : {}),
+      });
+    }
+  }
+  return out;
 }
 
 function replyQuoteTargetForMessage(

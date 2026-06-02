@@ -343,6 +343,10 @@ export async function handleCommentMention(deps: CommentDeps): Promise<void> {
             case 'text':
               answer += e.delta;
               break;
+            case 'tool_use':
+            case 'tool_result':
+              answer = '';
+              break;
             case 'system':
               break;
             case 'error':
@@ -521,7 +525,7 @@ export function buildCommentPrompt(
   );
   parts.push('');
   parts.push(
-    '回复要求：直接用纯文本，不要 markdown（不要 ** __ # - * > ` 之类的标记），不要代码块。云文档评论框不渲染 markdown，会原样显示这些符号。',
+    '回复要求：直接用纯文本，不要 markdown（不要 ** __ # - * > ` 之类的标记），不要代码块；不要输出内部思考、内部分析、读取步骤、工具调用过程或工具日志。若用户要求解释依据，只说明用户可见的依据和结论。云文档评论框不渲染 markdown，会原样显示这些符号。',
   );
   return parts.join('\n');
 }

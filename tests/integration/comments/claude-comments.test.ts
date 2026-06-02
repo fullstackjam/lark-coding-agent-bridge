@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { CommentEvent } from '@larksuiteoapi/node-sdk';
+import type { AgentEvent } from '../../../src/agent/types.js';
 import { ActiveRuns } from '../../../src/bot/active-runs.js';
 import { handleCommentMention } from '../../../src/bot/comments.js';
 import { ProcessPool } from '../../../src/bot/process-pool.js';
@@ -147,6 +148,28 @@ describe('Claude cloud-doc comment regression', () => {
     expect(h.createdTopLevelReplies).toEqual(['bold italic code\nitem\nquote']);
   });
 
+  it('keeps pre-tool progress text out of cloud-doc comment replies', async () => {
+    const h = await createCommentHarness({
+      getResponse: commentGet({ replyId: 'reply-1', question: 'review this doc' }),
+      agentEvents: [
+        { type: 'text', delta: '我先把文档读出来再 review。' },
+        {
+          type: 'tool_use',
+          id: 'tool-1',
+          name: 'Bash',
+          input: { command: 'lark-cli docs +fetch --doc doc-token' },
+        },
+        { type: 'tool_result', id: 'tool-1', output: 'doc body', isError: false },
+        { type: 'text', delta: '最终评审结论。' },
+        { type: 'done', sessionId: 'comment-session', terminationReason: 'normal' },
+      ],
+    });
+
+    await handleCommentMention(h.deps(event()));
+
+    expect(h.inThreadReplies.at(-1)).toBe('最终评审结论。');
+  });
+
   it('skips unsupported, unmentioned, or empty comment events without running the agent', async () => {
     const h = await createCommentHarness({
       getResponse: commentGet({ replyId: 'reply-empty', question: '' }),
@@ -168,7 +191,8 @@ async function createCommentHarness(options: {
   getErrorCode?: number;
   listResponses?: unknown[];
   replyErrorCode?: number;
-  agentText: string;
+  agentText?: string;
+  agentEvents?: readonly AgentEvent[];
 }): Promise<{
   tmp: TmpProfile;
   channel: FakeCommentChannel;
@@ -232,13 +256,12 @@ async function createCommentHarness(options: {
     },
   };
 
-  const agent = new FakeAgentAdapter({
-    events: [
-      { type: 'system', sessionId: 'comment-session', cwd: tmp.workspace },
-      { type: 'text', delta: options.agentText },
-      { type: 'done', sessionId: 'comment-session', terminationReason: 'normal' },
-    ],
-  });
+  const agentEvents = options.agentEvents ?? [
+    { type: 'system', sessionId: 'comment-session', cwd: tmp.workspace },
+    { type: 'text', delta: options.agentText ?? '' },
+    { type: 'done', sessionId: 'comment-session', terminationReason: 'normal' },
+  ];
+  const agent = new FakeAgentAdapter({ events: agentEvents });
   const sessions = new SessionStore(`${tmp.profile}/sessions.json`);
   const sessionCatalog = new SessionCatalog(`${tmp.profile}/session-catalog.json`);
   const workspaces = new WorkspaceStore(`${tmp.profile}/workspaces.json`);

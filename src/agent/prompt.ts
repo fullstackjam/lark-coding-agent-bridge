@@ -1,10 +1,22 @@
 export type BridgePromptSource = 'im' | 'card' | 'comment';
 
+export interface BridgePromptMention {
+  openId?: string;
+  name?: string;
+  isBot?: boolean;
+}
+
 export interface BridgePromptContext {
   chatId: string;
   chatType: string;
   senderId: string;
   senderName?: string;
+  /** Whether the sender is a human user or another bot ('app' sender). */
+  senderType?: 'user' | 'bot';
+  /** The bridge bot's own open_id — "this id is you" for self-identification. */
+  botOpenId?: string;
+  /** Accounts @-mentioned in the triggering message(s), deduped across the batch. */
+  mentions?: BridgePromptMention[];
   threadId?: string;
   messageIds?: string[];
   source: BridgePromptSource;

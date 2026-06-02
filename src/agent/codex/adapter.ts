@@ -13,7 +13,13 @@ import {
   type AgentAvailability,
   type AgentPreflightDiagnostic,
 } from '../preflight';
-import type { AgentAdapter, AgentEvent, AgentRun, AgentRunOptions } from '../types';
+import type {
+  AgentAdapter,
+  AgentBotIdentity,
+  AgentEvent,
+  AgentRun,
+  AgentRunOptions,
+} from '../types';
 import { buildCodexArgs } from './argv';
 import {
   CodexBinaryPinDriftError,
@@ -51,6 +57,7 @@ export class CodexAdapter implements AgentAdapter {
   private readonly sandbox: SandboxMode;
   private readonly defaultStopGraceMs: number;
   private readonly larkChannel: LarkChannelEnvContext | undefined;
+  private botIdentity: AgentBotIdentity | undefined;
 
   constructor(opts: CodexAdapterOptions) {
     this.binary = opts.binary;
@@ -63,6 +70,10 @@ export class CodexAdapter implements AgentAdapter {
     this.sandbox = opts.sandbox ?? 'danger-full-access';
     this.defaultStopGraceMs = opts.stopGraceMs ?? 5000;
     this.larkChannel = opts.larkChannel;
+  }
+
+  setBotIdentity(identity: AgentBotIdentity): void {
+    this.botIdentity = identity;
   }
 
   async isAvailable(): Promise<boolean> {
@@ -175,7 +186,7 @@ export class CodexAdapter implements AgentAdapter {
     child.stdin.on('error', (err) => {
       log.warn('agent', 'stdin-error', { message: err.message });
     });
-    child.stdin.end(prefixBridgeSystemPrompt(opts.prompt), 'utf8');
+    child.stdin.end(prefixBridgeSystemPrompt(opts.prompt, this.botIdentity), 'utf8');
 
     const stopGraceMs = opts.stopGraceMs ?? this.defaultStopGraceMs;
 

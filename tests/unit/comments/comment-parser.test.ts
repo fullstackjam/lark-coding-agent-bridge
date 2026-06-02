@@ -59,6 +59,8 @@ describe('comment parser', () => {
     expect(prompt).toContain('不要调用云文档评论或回复接口');
     expect(prompt).toContain('不要给评论添加或删除 reaction');
     expect(prompt).toContain('最终答案直接用纯文本交给 bridge');
+    expect(prompt).toContain('不要输出内部思考、内部分析、读取步骤、工具调用过程或工具日志');
+    expect(prompt).toContain('若用户要求解释依据，只说明用户可见的依据和结论');
     expect(prompt).not.toContain('`lark-cli docs +fetch --doc doc-token`');
   });
 
