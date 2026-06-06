@@ -116,6 +116,43 @@ describe('Opencode event translator', () => {
         }),
       ).toEqual([]);
     });
+
+    it('drops text parts that belong to a user message (prompt echo)', () => {
+      const translator = new OpencodeEventTranslator();
+      translator.translate({
+        kind: 'message',
+        sessionID: 's',
+        messageID: 'user-msg',
+        role: 'user',
+      });
+      expect(
+        translator.translate({
+          kind: 'part',
+          sessionID: 's',
+          messageID: 'user-msg',
+          partID: 'p1',
+          partType: 'text',
+          text: '<bridge_context>...</bridge_context>',
+        }),
+      ).toEqual([]);
+      // Assistant message parts still flow through unchanged.
+      translator.translate({
+        kind: 'message',
+        sessionID: 's',
+        messageID: 'asst-msg',
+        role: 'assistant',
+      });
+      expect(
+        translator.translate({
+          kind: 'part',
+          sessionID: 's',
+          messageID: 'asst-msg',
+          partID: 'p2',
+          partType: 'text',
+          delta: 'hi back',
+        }),
+      ).toEqual([{ type: 'text', delta: 'hi back' }]);
+    });
   });
 
   describe('part — text and reasoning', () => {

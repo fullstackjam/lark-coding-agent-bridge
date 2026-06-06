@@ -11,6 +11,13 @@ import type { NormalizedEvent } from './events';
 export class OpencodeEventTranslator {
   private toolUseEmitted = new Set<string>();
   private toolResultEmitted = new Set<string>();
+  // opencode persists the prompt as a user message and broadcasts
+  // `message.part.updated` for its text part too, so without this filter
+  // we'd echo the bridge prompt wrapper back to the chat as assistant
+  // output. We learn each messageID's role from `message.updated`
+  // (always emitted before its parts) and drop parts whose parent is a
+  // user message.
+  private userMessageIds = new Set<string>();
   private connectedEmitted = false;
   private sessionId: string | undefined;
   private cwd: string | undefined;
@@ -52,7 +59,9 @@ export class OpencodeEventTranslator {
         return [out];
       }
       case 'message':
-        // Role-only metadata; deltas come in via `part`.
+        // Role-only metadata; deltas come in via `part`. We record user
+        // messageIDs so translatePart can drop their echoed text parts.
+        if (evt.role === 'user') this.userMessageIds.add(evt.messageID);
         return [];
       case 'part':
         return this.translatePart(evt);
@@ -126,6 +135,7 @@ export class OpencodeEventTranslator {
   }
 
   private translatePart(evt: Extract<NormalizedEvent, { kind: 'part' }>): AgentEvent[] {
+    if (this.userMessageIds.has(evt.messageID)) return [];
     const t = evt.partType;
     if (t === 'text') {
       const delta = evt.delta ?? evt.text;
