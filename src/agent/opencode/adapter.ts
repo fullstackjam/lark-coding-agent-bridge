@@ -154,7 +154,10 @@ export class OpencodeAdapter implements AgentAdapter {
         ? { model: opts.model ?? this.defaultModel }
         : {}),
     });
-    const stream = new OpencodeEventStream({ baseUrl: this.server.baseUrl });
+    const stream = new OpencodeEventStream({
+      baseUrl: this.server.baseUrl,
+      directory: cwd,
+    });
     const stopGraceMs = opts.stopGraceMs ?? this.defaultStopGraceMs;
     const permissionTimeoutMs = this.permissionTimeoutMs;
 

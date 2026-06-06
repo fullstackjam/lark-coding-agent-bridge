@@ -50,6 +50,16 @@ export interface SubscribeOptions {
   sessionID?: string;
   /** Forward all events unfiltered (overrides sessionID filter). */
   noFilter?: boolean;
+  /**
+   * opencode scopes the SSE event stream per-project — events are only
+   * broadcast to subscribers whose `?directory=` matches the directory the
+   * session was created in. Without this, the bridge subscribes to whatever
+   * project happens to match the opencode server process's cwd and never
+   * sees its own session's events (no `session.status: idle`), so every run
+   * stalls until the upstream fallback fires ~5 minutes later. Must equal
+   * the `cwd` passed to `client.createSession`.
+   */
+  directory?: string;
 }
 
 /**
@@ -66,10 +76,14 @@ export class OpencodeEventStream extends EventEmitter {
   }
 
   async start(): Promise<void> {
-    const url = `${this.opts.baseUrl}/event`;
+    const search = this.opts.directory
+      ? `?directory=${encodeURIComponent(this.opts.directory)}`
+      : '';
+    const url = `${this.opts.baseUrl}/event${search}`;
     log.info('opencode.evt', 'subscribe', {
       url,
       sessionId: this.opts.sessionID ?? '*',
+      directory: this.opts.directory,
     });
     const res = await fetch(url, {
       headers: { accept: 'text/event-stream' },
