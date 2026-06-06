@@ -1,6 +1,8 @@
-# lark-channel-bridge
+# @fullstackjam/lark-coding-agent-bridge
 
-把飞书 / Lark 消息和本地 Claude Code 或 Codex CLI 打通的轻量 bot。用一条命令启动，扫码绑定 PersonalAgent 应用，然后在飞书里和本机编程助手对话，让它读图、处理文件、改代码。
+> **[zarazhangrui/lark-coding-agent-bridge](https://github.com/zarazhangrui/lark-coding-agent-bridge) 的私人 fork**（上游 npm 包名 `lark-channel-bridge`）。fork 存在的理由：在上游 Claude Code 与 Codex adapter 旁边再加一个 **opencode** adapter。下面大部分文档沿用上游内容，fork 特有改动会在行内标注。
+
+把飞书 / Lark 消息和本地 Claude Code、Codex 或 opencode CLI 打通的轻量 bot。用一条命令启动，扫码绑定 PersonalAgent 应用，然后在飞书里和本机编程助手对话，让它读图、处理文件、改代码。
 
 [English README](./README.md)
 

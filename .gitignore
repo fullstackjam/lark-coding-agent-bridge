@@ -13,7 +13,6 @@ coverage/
 .idea/
 .vscode/
 
-# Local maintenance scripts and unreleased changelog are not part of the package
+# Local maintenance scripts not part of the package
 scripts/
-CHANGELOG.md
 tests-smoke/

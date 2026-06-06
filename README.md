@@ -1,6 +1,8 @@
-# lark-channel-bridge
+# @fullstackjam/lark-coding-agent-bridge
 
-A lightweight bot that bridges Feishu / Lark messenger with your local Claude Code or Codex CLI. Run one command, scan a QR code to bind a PersonalAgent app, and talk to your local coding agent from chat.
+> **Private fork of [zarazhangrui/lark-coding-agent-bridge](https://github.com/zarazhangrui/lark-coding-agent-bridge) (upstream npm package: `lark-channel-bridge`).** The fork's reason for existing is to add an **opencode** adapter alongside the upstream's Claude Code and Codex adapters. Most documentation below is upstream's; fork-specific notes are flagged inline.
+
+A lightweight bot that bridges Feishu / Lark messenger with your local Claude Code, Codex, or opencode CLI. Run one command, scan a QR code to bind a PersonalAgent app, and talk to your local coding agent from chat.
 
 [中文 README](./README.zh.md)
 
