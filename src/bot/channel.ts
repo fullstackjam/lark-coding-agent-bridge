@@ -16,6 +16,7 @@ import type { AgentAdapter, AgentEvent } from '../agent/types';
 import { handleCardAction } from '../card/dispatcher';
 import { CallbackAuth } from '../card/callback-auth';
 import { CallbackNonceStore } from '../card/callback-store';
+import { permissionCard } from '../card/permission-card';
 import { renderCard } from '../card/run-renderer';
 import {
   finalizeIfRunning,
@@ -807,6 +808,40 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   const reactionPromise =
     replyMode === 'card' ? undefined : addWorkingReaction(channel, lastMsg.messageId);
 
+  // Permission card sender — currently only opencode emits permission_request.
+  // Send a fresh sibling card per request (not patched into the run card) so
+  // the running card stays intact and the user has a dedicated three-button
+  // prompt. Identical card visual is used in card / markdown / text reply
+  // modes since the permission prompt is always interactive.
+  const sendPermissionCard = async (req: {
+    id: string;
+    tool: string;
+    input?: unknown;
+    description?: string;
+  }): Promise<void> => {
+    const card = permissionCard({
+      requestId: req.id,
+      tool: req.tool,
+      ...(req.input !== undefined ? { input: req.input } : {}),
+      ...(req.description !== undefined ? { description: req.description } : {}),
+      ...(callbackAuth
+        ? {
+            signCallback: (action: string) =>
+              callbackAuth.sign({
+                runId: execution.runId,
+                scope,
+                chatId,
+                operatorOpenId: firstMsg.senderId,
+                action,
+                policyFingerprint: flow.policy.policyFingerprint,
+                ttlMs: 24 * 60 * 60 * 1000,
+              }),
+          }
+        : {}),
+    });
+    await channel.send(chatId, { card }, sendOpts);
+  };
+
   try {
     if (replyMode === 'card') {
       let latestState: RunState = initialState;
@@ -826,6 +861,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
             await cardCtrl.update(renderCard(filterForPrefs(state), cardRenderOptions));
           }
         },
+        sendPermissionCard,
       );
       const streamDone = channel.stream(
         chatId,
@@ -871,6 +907,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
             await markdownCtrl.setContent(renderText(filterForPrefs(state)));
           }
         },
+        sendPermissionCard,
       );
       const streamDone = channel.stream(
         chatId,
@@ -907,6 +944,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         idleTimeoutMs,
         recordSession,
         async () => {},
+        sendPermissionCard,
       );
       const body = renderText(filterForPrefs(finalState));
       if (body.trim()) {
@@ -933,6 +971,12 @@ async function processAgentStream(
   idleTimeoutMs: number | undefined,
   recordSession: (event: AgentEvent) => void,
   flush: (state: RunState) => Promise<void>,
+  onPermissionRequest?: (req: {
+    id: string;
+    tool: string;
+    input?: unknown;
+    description?: string;
+  }) => Promise<void>,
 ): Promise<RunState> {
   const runStart = Date.now();
   let state: RunState = initialState;
@@ -954,11 +998,19 @@ async function processAgentStream(
   let idleFired = false;
   let timer: NodeJS.Timeout | undefined;
   const inFlightTools = new Set<string>();
+  // Permission requests are also "in-flight" from the watchdog's perspective:
+  // opencode stops streaming until the user clicks a button (the adapter has
+  // its own 5-min auto-reject timer to bound the wait), so the IM idle
+  // watchdog must NOT fire while a permission is pending. Identical
+  // open/close semantics to inFlightTools — added on permission_request,
+  // drained when respondToPermission resolves (we approximate by clearing on
+  // the next non-permission event).
+  const pendingPermissions = new Set<string>();
   const armOrPauseIdle = (): void => {
     if (!idleTimeoutMs) return;
     if (timer) clearTimeout(timer);
     timer = undefined;
-    if (inFlightTools.size > 0) return;
+    if (inFlightTools.size > 0 || pendingPermissions.size > 0) return;
     timer = setTimeout(() => {
       idleFired = true;
       handle.interrupted = true;
@@ -986,11 +1038,48 @@ async function processAgentStream(
       } else if (evt.type === 'tool_result') {
         inFlightTools.delete(evt.id);
         log.info('agent', 'tool-done', { inFlight: inFlightTools.size });
+      } else if (evt.type === 'permission_request') {
+        pendingPermissions.add(evt.id);
+        log.info('agent', 'permission-pending', {
+          id: evt.id,
+          tool: evt.tool,
+          pending: pendingPermissions.size,
+        });
+      } else if (pendingPermissions.size > 0) {
+        // Any non-permission event means opencode is producing output again
+        // (either the user clicked allow and the tool ran, or the SSE
+        // continued for another reason). Drain the set so the idle
+        // watchdog can re-arm.
+        pendingPermissions.clear();
+        log.info('agent', 'permission-drained');
       }
       armOrPauseIdle();
 
       if (evt.type === 'system') {
         recordSession(evt);
+        continue;
+      }
+      if (evt.type === 'permission_request') {
+        // Fire-and-forget: we don't want the card-send latency to stall the
+        // event drain — the adapter has its own 5-min reject watchdog if
+        // nothing comes back.
+        if (onPermissionRequest) {
+          void onPermissionRequest({
+            id: evt.id,
+            tool: evt.tool,
+            ...(evt.input !== undefined ? { input: evt.input } : {}),
+            ...(evt.description !== undefined ? { description: evt.description } : {}),
+          }).catch((err) => {
+            log.fail('card', err, { step: 'permission-card' });
+          });
+        } else {
+          // Adapter emitted a permission request, but the caller didn't wire
+          // a handler. Auto-reject through the run so opencode unblocks.
+          log.warn('agent', 'permission-no-handler', { scope });
+          if (handle.run.respondToPermission) {
+            void handle.run.respondToPermission(evt.id, 'reject').catch(() => {});
+          }
+        }
         continue;
       }
       if (evt.type === 'usage') {

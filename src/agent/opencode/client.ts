@@ -86,6 +86,25 @@ export class OpencodeClient {
   }
 
   /**
+   * Answer a pending permission request raised by `permission.asked`. The
+   * `directory` is the cwd used when the session was created — opencode
+   * scopes the permission queue per-directory, so passing the wrong one
+   * (or omitting it for a directory-scoped queue) returns 404.
+   */
+  async replyPermission(
+    requestID: string,
+    reply: 'once' | 'always' | 'reject',
+    directory?: string,
+  ): Promise<void> {
+    const qs = directory ? `?directory=${encodeURIComponent(directory)}` : '';
+    await this.fetchJson(
+      'POST',
+      `/permission/${encodeURIComponent(requestID)}/reply${qs}`,
+      { reply },
+    );
+  }
+
+  /**
    * Kick off a prompt without holding the HTTP connection open for the
    * lifetime of the run. opencode returns 204 immediately. Callers should
    * watch SSE `/event` for `session.status: idle` to know when the run is

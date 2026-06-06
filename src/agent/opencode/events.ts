@@ -34,6 +34,12 @@ export type NormalizedEvent =
       kind: 'permission';
       sessionID: string;
       requestID: string;
+      /** Tool name (e.g. "bash", "edit", "read"); falls back to "tool" if absent. */
+      tool: string;
+      /** Best-effort input the agent wants to pass the tool; rendered on the card. */
+      input?: unknown;
+      /** Human-readable summary opencode supplied with the prompt (often empty). */
+      description?: string;
     }
   | { kind: 'error'; sessionID?: string; message: string }
   | { kind: 'raw'; envelope: RawOpencodeEvent };
@@ -190,10 +196,36 @@ function normalize(env: RawOpencodeEvent): NormalizedEvent | null {
     const props = env.properties as Record<string, unknown>;
     const sessionID = typeof props.sessionID === 'string' ? props.sessionID : undefined;
     const requestID = typeof props.id === 'string' ? props.id : undefined;
-    const permission = typeof props.permission === 'string' ? props.permission : '(unknown)';
-    log.info('opencode.evt', 'permission-asked', { sessionID, requestID, permission });
+    // opencode shapes vary across versions. The tool name has lived under
+    // `permission`, `pattern`, `tool`, or `metadata.tool`; the input under
+    // `metadata`, `args`, `input`, or `params`. Probe each so the card has
+    // something meaningful to render.
+    const tool =
+      pickString(props, ['tool']) ??
+      pickString(props, ['permission']) ??
+      pickString(props, ['pattern']) ??
+      pickString(props, ['metadata', 'tool']) ??
+      'tool';
+    const description =
+      pickString(props, ['title']) ??
+      pickString(props, ['description']) ??
+      pickString(props, ['message']);
+    const rawInput =
+      (props as Record<string, unknown>).metadata ??
+      (props as Record<string, unknown>).input ??
+      (props as Record<string, unknown>).args ??
+      (props as Record<string, unknown>).params;
+    const input = rawInput && typeof rawInput === 'object' ? rawInput : undefined;
+    log.info('opencode.evt', 'permission-asked', { sessionID, requestID, tool });
     if (!sessionID || !requestID) return null;
-    return { kind: 'permission', sessionID, requestID };
+    return {
+      kind: 'permission',
+      sessionID,
+      requestID,
+      tool,
+      ...(input !== undefined ? { input } : {}),
+      ...(description !== undefined ? { description } : {}),
+    };
   }
 
   if (env.type === 'message.part.updated') {

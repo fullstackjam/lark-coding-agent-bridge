@@ -167,6 +167,7 @@ const handlers: Record<string, Handler> = {
   '/doc': handleDoc,
   '/invite': handleInvite,
   '/remove': handleRemove,
+  '/permission': handlePermission,
 };
 
 /**
@@ -839,6 +840,55 @@ async function handleStop(args: string, ctx: CommandContext): Promise<void> {
   }
   // No reply for the current IM scope: if there was a run, its in-flight
   // render loop will mark the card as interrupted and re-render.
+}
+
+/**
+ * Card-only handler that answers an opencode permission_request. Triggered by
+ * the three buttons (允许一次 / 始终允许 / 拒绝) on the permission card. Not
+ * surfaced as a text command — typing `/permission ...` in chat does nothing
+ * useful, and the bridge token check below would reject it anyway.
+ *
+ * args shape: "<reply> <requestId>" where reply is once|always|reject.
+ */
+async function handlePermission(args: string, ctx: CommandContext): Promise<void> {
+  if (!ctx.fromCardAction) {
+    log.info('command', 'permission-ignored-non-card');
+    return;
+  }
+  const [replyRaw, ...rest] = args.trim().split(/\s+/);
+  const requestId = rest.join(' ').trim();
+  const reply = replyRaw === 'once' || replyRaw === 'always' || replyRaw === 'reject'
+    ? replyRaw
+    : undefined;
+  if (!reply || !requestId) {
+    log.warn('command', 'permission-bad-args', { args });
+    return;
+  }
+  const handle = ctx.activeRuns.get(ctx.scope);
+  if (!handle) {
+    // Run already ended (user clicked after termination). Silent no-op —
+    // the card's own buttons will be ignored once the run is gone.
+    log.info('command', 'permission-no-active-run', { scope: ctx.scope, requestId });
+    return;
+  }
+  const respond = handle.run.respondToPermission;
+  if (!respond) {
+    // Run belongs to an adapter without an interactive permission flow
+    // (Claude / Codex). Should never happen — the card is only sent for
+    // opencode — but guard so we don't crash.
+    log.warn('command', 'permission-no-handler', { scope: ctx.scope, requestId });
+    return;
+  }
+  try {
+    await respond.call(handle.run, requestId, reply);
+    log.info('command', 'permission-replied', {
+      scope: ctx.scope,
+      requestId,
+      reply,
+    });
+  } catch (err) {
+    log.fail('command', err, { cmd: 'permission' });
+  }
 }
 
 async function handleTimeout(args: string, ctx: CommandContext): Promise<void> {

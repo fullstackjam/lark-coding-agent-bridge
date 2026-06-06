@@ -68,14 +68,17 @@ export class OpencodeEventTranslator {
         }
         return [];
       case 'permission':
-        this.finished = true;
-        // Permission UX isn't wired yet; surface as a hard error so the run
-        // ends visibly instead of hanging on an un-answered prompt.
+        // Surface as a permission_request the bridge can answer out of band.
+        // We do NOT mark the run finished — opencode keeps the SSE stream
+        // open and the run will resume (or end) once respondToPermission()
+        // is invoked.
         return [
           {
-            type: 'error',
-            message: `opencode tool needs permission (not yet wired): ${evt.requestID}`,
-            terminationReason: 'failed',
+            type: 'permission_request',
+            id: evt.requestID,
+            tool: evt.tool,
+            ...(evt.input !== undefined ? { input: evt.input } : {}),
+            ...(evt.description !== undefined ? { description: evt.description } : {}),
           },
         ];
       case 'error':

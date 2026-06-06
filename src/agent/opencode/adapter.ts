@@ -25,10 +25,17 @@ export interface OpencodeAdapterOptions {
   model?: string;
   /** How long stop() waits for the abort RPC to settle before resolving. */
   stopGraceMs?: number;
+  /**
+   * How long the run waits for the user to answer a `permission_request`
+   * before auto-replying `reject`. Default 5 minutes. Set to 0 to disable
+   * the watchdog (the run will hang forever if the user never clicks).
+   */
+  permissionTimeoutMs?: number;
 }
 
 const DEFAULT_PORT = 4096;
 const DEFAULT_HOST = '127.0.0.1';
+const DEFAULT_PERMISSION_TIMEOUT_MS = 5 * 60 * 1000;
 
 /**
  * opencode talks HTTP+SSE, not stdin/stdout JSON, so the adapter looks very
@@ -53,6 +60,7 @@ export class OpencodeAdapter implements AgentAdapter {
   private readonly defaultAgent: string | undefined;
   private readonly defaultModel: string | undefined;
   private readonly defaultStopGraceMs: number;
+  private readonly permissionTimeoutMs: number;
   private readonly server: OpencodeServer;
   private readonly client: OpencodeClient;
   private botIdentity: AgentBotIdentity | undefined;
@@ -64,6 +72,8 @@ export class OpencodeAdapter implements AgentAdapter {
     this.defaultAgent = opts.agent;
     this.defaultModel = opts.model;
     this.defaultStopGraceMs = opts.stopGraceMs ?? 5000;
+    this.permissionTimeoutMs =
+      opts.permissionTimeoutMs ?? DEFAULT_PERMISSION_TIMEOUT_MS;
     this.server = new OpencodeServer({
       port: this.port,
       host: this.host,
@@ -126,14 +136,16 @@ export class OpencodeAdapter implements AgentAdapter {
     // here. Leaving this hook in place for parity with claude/codex.
     void this.botIdentity;
 
+    const cwd = opts.cwd;
     const translator = new OpencodeEventTranslator({
-      ...(opts.cwd ? { cwd: opts.cwd } : {}),
+      cwd,
       ...(opts.model ?? this.defaultModel
         ? { model: opts.model ?? this.defaultModel }
         : {}),
     });
     const stream = new OpencodeEventStream({ baseUrl: this.server.baseUrl });
     const stopGraceMs = opts.stopGraceMs ?? this.defaultStopGraceMs;
+    const permissionTimeoutMs = this.permissionTimeoutMs;
 
     // We bridge SSE callbacks → an async iterator with a hand-rolled queue.
     // Using EventEmitter directly would force a per-event `await new Promise`
@@ -145,6 +157,15 @@ export class OpencodeAdapter implements AgentAdapter {
     let runError: Error | null = null;
     let runExited = false;
     const exitWaiters: Array<() => void> = [];
+
+    // Track pending permission requests. The map carries the watchdog timer
+    // so respondToPermission() can clear it on a user-supplied answer;
+    // stop() iterates the keys to auto-reject everything outstanding.
+    interface PendingPermission {
+      timer: NodeJS.Timeout | null;
+      answered: boolean;
+    }
+    const pendingPermissions = new Map<string, PendingPermission>();
 
     const pushNorm = (n: NormalizedEvent): void => {
       queue.push(n);
@@ -212,12 +233,64 @@ export class OpencodeAdapter implements AgentAdapter {
 
     const adapterClient = this.client;
 
+    // Single funnel for answering a permission request. Idempotent: once a
+    // request has been answered (by user, by timeout, or by stop()), further
+    // calls are silent no-ops. Network errors on the reply RPC are logged
+    // but not propagated — the run can still progress when opencode's next
+    // SSE message arrives.
+    const sendPermissionReply = async (
+      requestId: string,
+      reply: 'once' | 'always' | 'reject',
+      source: 'user' | 'timeout' | 'stop',
+    ): Promise<void> => {
+      const pending = pendingPermissions.get(requestId);
+      if (pending?.answered) return;
+      if (pending) {
+        pending.answered = true;
+        if (pending.timer) clearTimeout(pending.timer);
+        pending.timer = null;
+      } else {
+        pendingPermissions.set(requestId, { timer: null, answered: true });
+      }
+      log.info('opencode.adapter', 'permission-reply', {
+        sessionId,
+        requestId,
+        reply,
+        source,
+      });
+      try {
+        await adapterClient.replyPermission(requestId, reply, cwd);
+      } catch (err) {
+        log.warn('opencode.adapter', 'permission-reply-failed', {
+          sessionId,
+          requestId,
+          source,
+          err: err instanceof Error ? err.message : String(err),
+        });
+      }
+    };
+
     return {
       runId: opts.runId,
       events: createEventStream(),
       async stop() {
         if (aborted) return;
         aborted = true;
+        // Pending permission requests: auto-reject before tearing down the
+        // SSE / session so opencode can actually emit its terminal event
+        // instead of sitting indefinitely on an un-answered prompt.
+        const pendingIds = [...pendingPermissions.entries()]
+          .filter(([, p]) => !p.answered)
+          .map(([id]) => id);
+        if (pendingIds.length > 0) {
+          log.info('opencode.adapter', 'stop-reject-pending', {
+            sessionId,
+            count: pendingIds.length,
+          });
+          await Promise.allSettled(
+            pendingIds.map((id) => sendPermissionReply(id, 'reject', 'stop')),
+          );
+        }
         log.info('opencode.adapter', 'stop', {
           sessionId,
           graceMs: stopGraceMs,
@@ -250,7 +323,45 @@ export class OpencodeAdapter implements AgentAdapter {
           exitWaiters.push(onExit);
         });
       },
+      async respondToPermission(
+        requestId: string,
+        reply: 'once' | 'always' | 'reject',
+      ): Promise<void> {
+        // Idempotent: if the run is over (aborted, exited) or the request
+        // was already answered (timeout, double-click) silently no-op.
+        if (runExited || aborted) {
+          log.info('opencode.adapter', 'permission-reply-after-end', {
+            sessionId,
+            requestId,
+            reply,
+          });
+          return;
+        }
+        await sendPermissionReply(requestId, reply, 'user');
+      },
     };
+
+    function armPermissionWatchdog(requestId: string): void {
+      if (permissionTimeoutMs <= 0) {
+        pendingPermissions.set(requestId, { timer: null, answered: false });
+        return;
+      }
+      const existing = pendingPermissions.get(requestId);
+      if (existing?.answered) return;
+      if (existing?.timer) clearTimeout(existing.timer);
+      const timer = setTimeout(() => {
+        log.warn('opencode.adapter', 'permission-timeout', {
+          sessionId,
+          requestId,
+          timeoutMs: permissionTimeoutMs,
+        });
+        void sendPermissionReply(requestId, 'reject', 'timeout');
+      }, permissionTimeoutMs);
+      // Don't keep the Node event loop alive solely on this timer — the
+      // SSE pump is the real liveness gate.
+      if (typeof timer.unref === 'function') timer.unref();
+      pendingPermissions.set(requestId, { timer, answered: false });
+    }
 
     async function* createEventStream(): AsyncGenerator<AgentEvent> {
       // Wait for startup to either succeed or fail before yielding anything;
@@ -269,6 +380,9 @@ export class OpencodeAdapter implements AgentAdapter {
           }
           const evt = queue.shift()!;
           for (const out of translator.translate(evt)) {
+            if (out.type === 'permission_request') {
+              armPermissionWatchdog(out.id);
+            }
             yield out;
           }
           if (translator.isFinished()) break;
@@ -292,6 +406,14 @@ export class OpencodeAdapter implements AgentAdapter {
           }
         }
       } finally {
+        // Cancel any pending permission watchdogs so they don't fire after
+        // the run has already ended (and don't keep the loop alive).
+        for (const pending of pendingPermissions.values()) {
+          if (pending.timer) {
+            clearTimeout(pending.timer);
+            pending.timer = null;
+          }
+        }
         stream.close();
         markExited();
         log.info('opencode.adapter', 'run-end', {

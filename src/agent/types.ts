@@ -10,6 +10,21 @@ export type AgentEvent =
   | { type: 'tool_use'; id: string; name: string; input: unknown }
   | { type: 'tool_result'; id: string; output: string; isError: boolean }
   | {
+      /**
+       * Agent paused mid-run waiting for the user to approve / reject a tool
+       * call. Only opencode emits this today; Claude and Codex have their own
+       * non-interactive permission flows. The bridge must call
+       * AgentRun.respondToPermission(id, ...) to release the agent — the SSE
+       * stream keeps flowing during the wait, but no `done` will arrive until
+       * the request is answered (or auto-rejected on timeout).
+       */
+      type: 'permission_request';
+      id: string;
+      tool: string;
+      input?: unknown;
+      description?: string;
+    }
+  | {
       type: 'usage';
       inputTokens?: number;
       outputTokens?: number;
@@ -63,6 +78,17 @@ export interface AgentRun {
    * 143 instead of 0; waiting it out lets it exit cleanly.
    */
   waitForExit(timeoutMs: number): Promise<boolean>;
+  /**
+   * Reply to a pending `permission_request` event. Adapters that don't have
+   * an interactive permission flow (Claude / Codex) may omit this — every
+   * caller MUST tolerate runs that lack it. Idempotent: calling twice for
+   * the same `requestId`, or calling after the run has ended, is a no-op
+   * and must not throw.
+   */
+  respondToPermission?(
+    requestId: string,
+    reply: 'once' | 'always' | 'reject',
+  ): Promise<void>;
 }
 
 /**
