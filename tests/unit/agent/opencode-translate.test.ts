@@ -344,12 +344,30 @@ describe('Opencode event translator', () => {
   });
 
   describe('error', () => {
-    it('emits a typed error event and marks the translator finished', () => {
+    it('emits a typed error event with forwarded sessionId and marks the translator finished', () => {
       const translator = new OpencodeEventTranslator({ sessionId: 's1' });
       expect(translator.translate({ kind: 'error', sessionID: 's1', message: 'oops' })).toEqual([
-        { type: 'error', message: 'oops', terminationReason: 'failed' },
+        { type: 'error', message: 'oops', terminationReason: 'failed', sessionId: 's1' },
       ]);
       expect(translator.isFinished()).toBe(true);
+    });
+
+    it('falls back to the translator session when the upstream event omits sessionID but it is known locally', () => {
+      const translator = new OpencodeEventTranslator({ sessionId: 's-local' });
+      expect(translator.translate({ kind: 'error', message: 'boom' })).toEqual([
+        { type: 'error', message: 'boom', terminationReason: 'failed', sessionId: 's-local' },
+      ]);
+    });
+
+    it('omits sessionId entirely when neither the upstream event nor the translator carries one', () => {
+      const translator = new OpencodeEventTranslator();
+      const [out] = translator.translate({ kind: 'error', message: 'no-context' });
+      expect(out).toEqual({
+        type: 'error',
+        message: 'no-context',
+        terminationReason: 'failed',
+      });
+      expect(out).not.toHaveProperty('sessionId');
     });
 
     it('ignores subsequent events after the error event', () => {
@@ -392,9 +410,25 @@ describe('Opencode event translator', () => {
     it('emits an error event with custom message when finishing with failed', () => {
       const translator = new OpencodeEventTranslator({ sessionId: 's1' });
       expect(translator.finishWith('failed', 'startup blew up')).toEqual([
-        { type: 'error', message: 'startup blew up', terminationReason: 'failed' },
+        {
+          type: 'error',
+          message: 'startup blew up',
+          terminationReason: 'failed',
+          sessionId: 's1',
+        },
       ]);
       expect(translator.isFinished()).toBe(true);
+    });
+
+    it('omits sessionId on failed when the translator has no session yet (e.g. createSession blew up)', () => {
+      const translator = new OpencodeEventTranslator();
+      const [out] = translator.finishWith('failed', 'no session');
+      expect(out).toEqual({
+        type: 'error',
+        message: 'no session',
+        terminationReason: 'failed',
+      });
+      expect(out).not.toHaveProperty('sessionId');
     });
   });
 

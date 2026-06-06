@@ -264,18 +264,18 @@ describe('OpencodeAdapter lifecycle', () => {
     return out;
   }
 
-  it('prepareRun starts the embedded server and is idempotent across runs', async () => {
+  it('prepareRun starts the embedded server exactly once across runs', async () => {
     const adapter = new OpencodeAdapter();
     const opts = { runId: 'r1', prompt: 'hi', cwd: '/tmp/bridge-test' };
 
     await adapter.prepareRun(opts);
     await adapter.prepareRun({ ...opts, runId: 'r2' });
+    await adapter.prepareRun({ ...opts, runId: 'r3' });
 
-    // The adapter calls server.start() on every prepareRun, but OpencodeServer
-    // is itself idempotent (early returns if already started or reusable).
-    // What the adapter contract promises is that prepareRun NEVER throws when
-    // called more than once on the same instance; pin that behaviour.
-    expect(serverState.startCalls).toBeGreaterThanOrEqual(1);
+    // The adapter tracks a `started` flag and short-circuits subsequent
+    // prepareRun calls. OpencodeServer.start() is itself idempotent, but the
+    // adapter shouldn't be redundantly poking it on every run.
+    expect(serverState.startCalls).toBe(1);
   });
 
   it('creates a new session when run() is called without a sessionId', async () => {
@@ -472,7 +472,7 @@ describe('OpencodeAdapter lifecycle', () => {
     expect(replies[0]?.reply).toBe('once');
   });
 
-  it('auto-rejects a pending permission request after the configured timeout', async () => {
+  it('permission watchdog auto-rejects AND terminates the run with a `done` + `timeout` event', async () => {
     vi.useFakeTimers();
     streamState.scheduledStart = (stream) => {
       stream.emit('event', { kind: 'connected' });
@@ -482,7 +482,8 @@ describe('OpencodeAdapter lifecycle', () => {
         requestID: 'perm-1',
         tool: 'bash',
       });
-      // No idle, no further events — pure timeout path.
+      // No idle, no further events — pure timeout path. The watchdog MUST
+      // tear the SSE down on its own; the test does NOT call run.stop().
     };
 
     const adapter = new OpencodeAdapter({ permissionTimeoutMs: 1000 });
@@ -498,18 +499,25 @@ describe('OpencodeAdapter lifecycle', () => {
     // Let setImmediate fire so the SSE events land in the translator queue
     // and the permission watchdog is armed.
     await vi.advanceTimersByTimeAsync(0);
-    // Cross the watchdog deadline.
+    // Cross the watchdog deadline. The watchdog should fire the auto-reject,
+    // close the SSE, and let the iterator emit the terminal `done` event.
     await vi.advanceTimersByTimeAsync(1100);
-    // Stop the run so the iterator drains. (The auto-reject only answers the
-    // permission; it does not by itself terminate the SSE — pin that.)
-    await run.stop();
     await consumer;
 
+    // Best-effort reject was issued to opencode.
     expect(clientState.replyPermissionCalls).toContainEqual({
       requestId: 'perm-1',
       reply: 'reject',
       directory: '/work/dir',
     });
+    // The run terminated on its own — last event is a done/timeout, no
+    // explicit run.stop() needed.
+    const last = events[events.length - 1] as Extract<AgentEvent, { type: 'done' }>;
+    expect(last.type).toBe('done');
+    expect(last.terminationReason).toBe('timeout');
+    expect(last.sessionId).toBe('sess-A');
+    // No abort RPC should have been sent — stop() was never called.
+    expect(clientState.abortCalls).toEqual([]);
   });
 
   it('stop() auto-rejects pending permission requests before tearing down', async () => {

@@ -81,15 +81,20 @@ export class OpencodeEventTranslator {
             ...(evt.description !== undefined ? { description: evt.description } : {}),
           },
         ];
-      case 'error':
+      case 'error': {
         this.finished = true;
-        return [
-          {
-            type: 'error',
-            message: evt.message,
-            terminationReason: 'failed',
-          },
-        ];
+        const out: Extract<AgentEvent, { type: 'error' }> = {
+          type: 'error',
+          message: evt.message,
+          terminationReason: 'failed',
+        };
+        // Forward sessionID when the upstream NormalizedEvent carried one
+        // (opencode populates it on session.error). When missing, keep the
+        // field off entirely — callers tolerate absence either way.
+        if (evt.sessionID) out.sessionId = evt.sessionID;
+        else if (this.sessionId) out.sessionId = this.sessionId;
+        return [out];
+      }
       case 'raw':
         return [];
     }
@@ -104,13 +109,13 @@ export class OpencodeEventTranslator {
     if (this.finished) return [];
     this.finished = true;
     if (reason === 'failed') {
-      return [
-        {
-          type: 'error',
-          message: message ?? 'opencode run failed',
-          terminationReason: 'failed',
-        },
-      ];
+      const err: Extract<AgentEvent, { type: 'error' }> = {
+        type: 'error',
+        message: message ?? 'opencode run failed',
+        terminationReason: 'failed',
+      };
+      if (this.sessionId) err.sessionId = this.sessionId;
+      return [err];
     }
     const out: AgentEvent = {
       type: 'done',

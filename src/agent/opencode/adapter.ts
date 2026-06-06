@@ -65,6 +65,13 @@ export class OpencodeAdapter implements AgentAdapter {
   private readonly server: OpencodeServer;
   private readonly client: OpencodeClient;
   private botIdentity: AgentBotIdentity | undefined;
+  /**
+   * Whether `server.start()` has already resolved successfully on this
+   * adapter instance. OpencodeServer.start() is internally idempotent, but
+   * skipping the call once we know the server is up avoids a redundant
+   * `this.proc || this.reused` short-circuit on every `prepareRun()`.
+   */
+  private started = false;
 
   constructor(opts: OpencodeAdapterOptions = {}) {
     this.binary = opts.binary ?? 'opencode';
@@ -114,6 +121,7 @@ export class OpencodeAdapter implements AgentAdapter {
         availability.diagnostic,
       );
     }
+    if (this.started) return;
     try {
       await this.server.start();
     } catch (err) {
@@ -123,6 +131,7 @@ export class OpencodeAdapter implements AgentAdapter {
         'agent-version-check-spawn-failed',
       );
     }
+    this.started = true;
   }
 
   run(opts: AgentRunOptions): AgentRun {
@@ -156,6 +165,7 @@ export class OpencodeAdapter implements AgentAdapter {
     const waiters: Array<() => void> = [];
     let streamClosed = false;
     let aborted = false;
+    let timedOut = false;
     let runError: Error | null = null;
     let runExited = false;
     const exitWaiters: Array<() => void> = [];
@@ -358,7 +368,14 @@ export class OpencodeAdapter implements AgentAdapter {
           requestId,
           timeoutMs: permissionTimeoutMs,
         });
+        // The reply RPC is best-effort: even if opencode swallows it (network
+        // glitch, server bug), the run MUST still end. Mark the run as
+        // timed-out, tear the SSE down the same way stop() does, and let the
+        // iterator's terminal block synthesise the `done` + 'timeout' event.
+        timedOut = true;
         void sendPermissionReply(requestId, 'reject', 'timeout');
+        stream.close();
+        closeQueue();
       }, permissionTimeoutMs);
       // Don't keep the Node event loop alive solely on this timer — the
       // SSE pump is the real liveness gate.
@@ -395,6 +412,12 @@ export class OpencodeAdapter implements AgentAdapter {
             for (const out of translator.finishWith('failed', runError.message)) {
               yield out;
             }
+          } else if (timedOut) {
+            // Permission watchdog fired and tore the stream down. Surface a
+            // terminal `done` with `terminationReason: 'timeout'` so the run
+            // ends on its own, independent of whatever opencode does (or
+            // doesn't) emit downstream of the auto-reject.
+            for (const out of translator.finishWith('timeout')) yield out;
           } else if (aborted) {
             for (const out of translator.finishWith('interrupted')) yield out;
           } else {

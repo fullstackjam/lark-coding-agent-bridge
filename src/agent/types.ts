@@ -38,7 +38,18 @@ export type AgentEvent =
       threadId?: string;
       terminationReason: 'normal' | 'interrupted' | 'timeout';
     }
-  | { type: 'error'; message: string; terminationReason: 'failed' | 'interrupted' | 'timeout' };
+  | {
+      type: 'error';
+      message: string;
+      terminationReason: 'failed' | 'interrupted' | 'timeout';
+      /**
+       * Optional session correlation. Only opencode populates it today
+       * (the upstream `NormalizedEvent` carries `sessionID` and the
+       * translator forwards it); claude/codex emit `error` without it.
+       * Callers MUST tolerate its absence.
+       */
+      sessionId?: string;
+    };
 
 export const CLAUDE_DEFAULT_PERMISSION_MODE: ClaudePermissionMode = 'bypassPermissions';
 
