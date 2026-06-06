@@ -7,6 +7,15 @@ This is a private fork of [zarazhangrui/lark-coding-agent-bridge](https://github
 
 Upstream history is not duplicated here; consult [the upstream repo](https://github.com/zarazhangrui/lark-coding-agent-bridge/commits/main) for changes inherited at fork time.
 
+## [0.2.1] - 2026-06-07
+
+### Fixed
+- **opencode SSE 事件作用域错配**：`OpencodeEventStream.start()` 订阅 `/event` 时现在带上 `?directory=<cwd>`，与 `client.createSession(cwd)` 对齐。opencode 服务端按 project 隔离事件广播，不传 directory 时 bridge 订到的是 opencode serve 自身 cwd 对应的 project，永远收不到自己 session 的 `session.status: idle`，每次 run 都要等 ~5 分钟上游 fallback 才结束。
+- **用户消息被回流为 assistant 输出**：`OpencodeEventTranslator` 现在跟踪 `message.updated` 携带的 role，把 user message 上的 part 全部丢弃。opencode 把 `prompt_async` 的 user prompt 持久化后也广播 `message.part.updated`，translator 之前不分 role 把 text part 一律翻译成 `text` 事件，导致 bridge 把 `<bridge_context>...</user_input>` wrapper 当成模型输出回灌到飞书聊天。
+
+### Tests
+- 新增 translator 测试：登记 user role 的 message 框架后，同 messageID 的 text part 应被 drop；同 stream 上 assistant 的 text part 仍正常 emit。
+
 ## [0.2.0] - 2026-06-07
 
 ### Added
