@@ -1,5 +1,6 @@
 import { log } from '../../core/logger';
 import { SpawnFailed } from '../../runtime/errors';
+import { buildBridgeSystemPrompt } from '../bridge-system-prompt';
 import { checkAgentAvailability, type AgentAvailability } from '../preflight';
 import type {
   AgentAdapter,
@@ -129,12 +130,13 @@ export class OpencodeAdapter implements AgentAdapter {
       throw new Error('cwd is required for OpencodeAdapter.run');
     }
 
-    // We track the identity locally so setBotIdentity isn't a no-op should
-    // the channel decide to use it later. Currently we don't bake the bot
-    // open_id into a system prompt — opencode owns its own system prompt
-    // and the bridge doesn't have an `--append-system-prompt` equivalent
-    // here. Leaving this hook in place for parity with claude/codex.
-    void this.botIdentity;
+    // opencode's `/session/{id}/prompt_async` accepts a top-level optional
+    // `system` string that gets appended to the model's system prompt array
+    // (see sst/opencode session/llm/request.ts). opencode reads the most
+    // recent user message's `system` per turn (`lastUser.system`), so we
+    // resend the bridge prompt on every prompt body — the string is
+    // deterministic per identity, so this is idempotent.
+    const bridgeSystemPrompt = buildBridgeSystemPrompt(this.botIdentity);
 
     const cwd = opts.cwd;
     const translator = new OpencodeEventTranslator({
@@ -215,6 +217,7 @@ export class OpencodeAdapter implements AgentAdapter {
         await this.client.promptAsync({
           sessionId,
           parts: [{ type: 'text', text: opts.prompt }],
+          system: bridgeSystemPrompt,
           ...(opts.model ?? this.defaultModel
             ? { model: opts.model ?? this.defaultModel }
             : {}),

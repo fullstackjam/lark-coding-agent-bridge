@@ -41,6 +41,13 @@ export interface PromptOptions {
   agent?: string;
   /** "providerID/modelID" — parsed and forwarded to opencode. */
   model?: string;
+  /**
+   * Optional per-prompt system prompt. opencode appends this to the model's
+   * system prompt array (see sst/opencode session/llm/request.ts:
+   * `...(input.user.system ? [input.user.system] : [])`). Forwarded verbatim
+   * as the top-level `system` field on the prompt body.
+   */
+  system?: string;
   /** Per-prompt tool toggles. Maps tool name → enabled. */
   tools?: Record<string, boolean>;
   /** Abort signal forwarded to fetch. */
@@ -123,6 +130,7 @@ export class OpencodeClient {
     const model = parseModel(o.model ?? this.opts.model);
     if (agent) body.agent = agent;
     if (model) body.model = model;
+    if (o.system !== undefined) body.system = o.system;
     if (o.tools) body.tools = o.tools;
     return body;
   }
