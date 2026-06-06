@@ -37,6 +37,17 @@ const streamState = vi.hoisted(() => ({
   }>,
 }));
 
+// Stub the binary preflight so prepareRun() doesn't try to spawn a real
+// `opencode --version`. CI runners don't have opencode installed; locally
+// it would just slow tests down.
+vi.mock('../../../src/agent/preflight', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../../src/agent/preflight')>();
+  return {
+    ...actual,
+    checkAgentAvailability: async () => ({ ok: true as const, version: '0.0.0-test' }),
+  };
+});
+
 vi.mock('../../../src/agent/opencode/client', () => {
   class OpencodeClient {
     constructor(_opts: unknown) {
