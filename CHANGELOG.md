@@ -7,6 +7,20 @@ This is a private fork of [zarazhangrui/lark-coding-agent-bridge](https://github
 
 Upstream history is not duplicated here; consult [the upstream repo](https://github.com/zarazhangrui/lark-coding-agent-bridge/commits/main) for changes inherited at fork time.
 
+## [0.2.0] - 2026-06-07
+
+### Added
+- **Interactive permission UX** for opencode. opencode's `permission.asked` SSE event used to surface as a fatal error and end the run; it now becomes a `permission_request` `AgentEvent` and surfaces in Feishu as a card with three buttons (`允许一次` / `始终允许` / `拒绝`). The user's choice rides the existing `__bridge_cb` signed-callback path back to `OpencodeClient.replyPermission()`. New optional `AgentRun.respondToPermission(requestId, reply)` on the adapter interface; Claude and Codex omit it (their permission flow is non-interactive). 5-minute `permissionTimeoutMs` watchdog auto-rejects if the card is ignored and terminates the run with `done.terminationReason='timeout'` instead of waiting indefinitely on opencode.
+- **Bridge system prompt injected into every opencode prompt** via the `system` field on `prompt_async`. Confirmed against sst/opencode source (`packages/opencode/src/session/llm/request.ts`): the `system` field is concatenated into the model's system prompt array per turn. Idempotent — the same identity-derived prompt is resent on every turn rather than first-time-only. `PromptInjectionMode` gains a new `'prompt-body-system'` value.
+- Optional `sessionId` on the `error` variant of `AgentEvent`, forwarded by the opencode translator when known. Non-breaking type-additive — Claude / Codex error paths don't set it.
+
+### Fixed
+- `OpencodeAdapter.prepareRun()` no longer re-calls `server.start()` after the first time. `OpencodeServer.start()` was internally idempotent, so this was wasted work, not a bug — but the call count is now `1` not `N`.
+- The opencode permission watchdog now closes the SSE stream and yields a terminal `done` event itself instead of waiting for opencode to emit `status:idle` after a timeout reject. If opencode ever swallows the reject the run still terminates.
+
+### Tests
+- Translator + adapter coverage grew from 6 → 42 focused unit tests (translator now covers every `AgentEvent` shape and the per-tool-id dedupe state machine; adapter now covers prepareRun idempotency, session create/reuse, stream ordering, abort, respondToPermission, watchdog auto-reject, and idempotent stop). Total suite: 89 files / 556 tests.
+
 ## [0.1.0] - 2026-06-07
 
 The first release of the fork. Adds **opencode** as a third local agent alongside upstream's Claude Code and Codex.
