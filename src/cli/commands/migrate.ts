@@ -43,7 +43,13 @@ export async function runMigrate(opts: MigrateOptions): Promise<void> {
   const configPath = opts.config ?? paths.configFile;
   await migrateLegacyPaths();
   await migrateConfigShape(configPath);
-  const agentKind = agentKindFromString(opts.agent) ?? (opts.profile === 'codex' ? 'codex' : undefined);
+  const agentKind =
+    agentKindFromString(opts.agent) ??
+    (opts.profile === 'codex'
+      ? 'codex'
+      : opts.profile === 'opencode'
+        ? 'opencode'
+        : undefined);
   const needsV2Migration = await hasLegacyProfileConfig(configPath);
   const result = await migrateProfileV2WithActiveBridgePrompt({
     rootDir: dirname(configPath),
