@@ -99,6 +99,25 @@ describe('profile schema', () => {
     });
   });
 
+  it('normalizes workbench group owners to a chat owner map', () => {
+    const cfg = normalizeProfileConfig({
+      schemaVersion: 2,
+      agentKind: 'claude',
+      accounts: { app },
+      workbenchGroups: {
+        oc_workbench: 'ou_owner',
+        oc_blank: '',
+        oc_numeric: 123,
+      },
+    }) as ReturnType<typeof normalizeProfileConfig> & {
+      workbenchGroups?: Record<string, string>;
+    };
+
+    expect(cfg.workbenchGroups).toEqual({
+      oc_workbench: 'ou_owner',
+    });
+  });
+
   it('drops invalid legacy message reply values instead of blocking config load', () => {
     const cfg = normalizeProfileConfig({
       schemaVersion: 2,

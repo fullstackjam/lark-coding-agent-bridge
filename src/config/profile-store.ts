@@ -53,6 +53,7 @@ type StoredProfileConfig = Pick<
   | 'secrets'
   | 'preferences'
   | 'access'
+  | 'workbenchGroups'
   | 'workspaces'
   | 'permissions'
   | 'codex'
@@ -90,6 +91,7 @@ function serializeProfileConfig(profile: ProfileConfig): StoredProfileConfig {
     ...(profile.secrets ? { secrets: profile.secrets } : {}),
     preferences: profile.preferences,
     access: profile.access,
+    workbenchGroups: profile.workbenchGroups,
     workspaces: profile.workspaces,
     permissions: profile.permissions,
     ...(profile.codex ? { codex: profile.codex } : {}),

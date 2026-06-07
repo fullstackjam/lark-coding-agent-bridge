@@ -83,6 +83,7 @@ export interface ProfileConfig {
   secrets?: SecretsConfig;
   preferences: Omit<AppPreferences, 'access' | 'requireMentionInGroup'>;
   access: ProfileAccess;
+  workbenchGroups: Record<string, string>;
   workspaces: {
     default?: string;
   };
@@ -139,6 +140,7 @@ export function normalizeProfileConfig(input: unknown): ProfileConfig {
     secrets?: SecretsConfig;
     preferences?: (AppPreferences & { access?: Partial<ProfileAccess> }) | undefined;
     access?: Partial<ProfileAccess>;
+    workbenchGroups?: unknown;
     workspaces?: {
       default?: unknown;
       // Legacy workspace authorization fields are accepted for config
@@ -175,6 +177,7 @@ export function normalizeProfileConfig(input: unknown): ProfileConfig {
     raw.access ?? raw.preferences?.access,
     raw.preferences?.requireMentionInGroup,
   );
+  const workbenchGroups = normalizeWorkbenchGroups(raw.workbenchGroups);
   const { permissions, source: permissionSource } = normalizePermissions({
     permissions: raw.permissions,
     sandbox: raw.sandbox,
@@ -191,6 +194,7 @@ export function normalizeProfileConfig(input: unknown): ProfileConfig {
     ...(raw.secrets ? { secrets: raw.secrets } : {}),
     preferences,
     access,
+    workbenchGroups,
     workspaces,
     sandbox,
     permissions,
@@ -207,6 +211,18 @@ export function normalizeProfileConfig(input: unknown): ProfileConfig {
     comments,
     larkCli,
   };
+}
+
+function normalizeWorkbenchGroups(input: unknown): Record<string, string> {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return {};
+  const out: Record<string, string> = {};
+  for (const [rawChatId, rawOwnerOpenId] of Object.entries(input)) {
+    const chatId = rawChatId.trim();
+    const ownerOpenId = typeof rawOwnerOpenId === 'string' ? rawOwnerOpenId.trim() : '';
+    if (!chatId || !ownerOpenId) continue;
+    out[chatId] = ownerOpenId;
+  }
+  return out;
 }
 
 function normalizeAccounts(input: unknown): ProfileConfig['accounts'] {
