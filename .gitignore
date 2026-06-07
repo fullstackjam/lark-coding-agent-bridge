@@ -16,3 +16,7 @@ coverage/
 # Local maintenance scripts not part of the package
 scripts/
 tests-smoke/
+
+# oh-my-openagent runtime state — concrete opencode session IDs and
+# background-task continuation snapshots. Machine-local; not for git.
+.omo/

@@ -27,6 +27,10 @@ export type NormalizedEvent =
       toolName?: string;
       toolState?: string;
       toolInput?: Record<string, unknown>;
+      /** Tool output (opencode puts it under `part.state.output`; Claude/Codex use `text`). */
+      toolOutput?: string;
+      /** Human-readable title opencode renders alongside running/completed tools (e.g. "Read src/foo.ts"). */
+      toolTitle?: string;
     }
   | { kind: 'status'; sessionID: string; status: string }
   | {
@@ -174,6 +178,15 @@ export class OpencodeEventStream extends EventEmitter {
   }
 }
 
+/**
+ * Map a raw opencode SSE envelope to a NormalizedEvent. Exported for tests;
+ * production code goes through `OpencodeEventStream` which calls it on each
+ * parsed event.
+ */
+export function normalizeOpencodeEvent(env: RawOpencodeEvent): NormalizedEvent | null {
+  return normalize(env);
+}
+
 function normalize(env: RawOpencodeEvent): NormalizedEvent | null {
   if (env.type === 'server.connected') return { kind: 'connected' };
 
@@ -250,7 +263,12 @@ function normalize(env: RawOpencodeEvent): NormalizedEvent | null {
     const partID = typeof part.id === 'string' ? part.id : undefined;
     const partType = typeof part.type === 'string' ? part.type : undefined;
     if (!sessionID || !messageID || !partID || !partType) return null;
-    const toolInput = part.input ?? part.args ?? part.params;
+    // opencode's ToolPart nests input/output/title under `state`; older shapes
+    // (and other adapters) put them on the part itself. Probe state first.
+    const state = part.state && typeof part.state === 'object' ? (part.state as Record<string, unknown>) : undefined;
+    const toolInput = state?.input ?? part.input ?? part.args ?? part.params;
+    const toolOutput = typeof state?.output === 'string' ? state.output : undefined;
+    const toolTitle = typeof state?.title === 'string' ? state.title : undefined;
     return {
       kind: 'part',
       sessionID,
@@ -265,6 +283,8 @@ function normalize(env: RawOpencodeEvent): NormalizedEvent | null {
         toolInput && typeof toolInput === 'object'
           ? (toolInput as Record<string, unknown>)
           : undefined,
+      ...(toolOutput !== undefined ? { toolOutput } : {}),
+      ...(toolTitle !== undefined ? { toolTitle } : {}),
     };
   }
 

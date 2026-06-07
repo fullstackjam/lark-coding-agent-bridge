@@ -16,10 +16,20 @@ type Group = ToolGroup | TextGroup;
 
 export interface RunCardRenderOptions {
   signCallback?: (action: string) => string;
+  /**
+   * Optional banner shown at the top of the card. Used by the wake-up
+   * watcher to signal "this card is the bot continuing on its own after a
+   * background task finished, not a reply to a user message you just sent".
+   */
+  headerBanner?: string;
 }
 
 export function renderCard(state: RunState, options: RunCardRenderOptions = {}): object {
   const elements: object[] = [];
+
+  if (options.headerBanner) {
+    elements.push(noteMd(options.headerBanner));
+  }
 
   if (state.reasoning.content) {
     elements.push(reasoningPanel(state.reasoning.content, state.reasoning.active));

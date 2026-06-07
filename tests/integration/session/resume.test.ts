@@ -1,7 +1,11 @@
 import { realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { claudeCapability, codexCapability } from '../../../src/agent/capability.js';
+import {
+  claudeCapability,
+  codexCapability,
+  opencodeCapability,
+} from '../../../src/agent/capability.js';
 import { ActiveRuns } from '../../../src/bot/active-runs.js';
 import { ProcessPool } from '../../../src/bot/process-pool.js';
 import {
@@ -172,9 +176,77 @@ describe('agent-aware run-flow resume', () => {
     ).toMatchObject({ threadId: 'thread-recorded' });
     expect(codex.sessions.getRaw('chat-1')).toBeUndefined();
   });
+
+  it('resumes opencode session from the agent-aware catalog', async () => {
+    const h = await createHarness('opencode');
+    const first = await start(h);
+    expect(first.ok).toBe(true);
+    if (!first.ok) throw new Error('expected initial run');
+    await collect(first.execution.subscribe());
+
+    h.catalog.upsertActive({
+      scopeId: 'chat-1',
+      agentId: 'opencode',
+      cwdRealpath: first.cwdRealpath,
+      policyFingerprint: first.policy.policyFingerprint,
+      sessionId: 'ses_catalog',
+      now: 1000,
+    });
+
+    const second = await start(h);
+    expect(second.ok).toBe(true);
+    if (!second.ok) throw new Error('expected resumed run');
+    expect(second.resumeFrom).toBe('ses_catalog');
+    expect(h.agent.runOptions[1]).toMatchObject({
+      sessionId: 'ses_catalog',
+      threadId: undefined,
+    });
+  });
+
+  it('falls back to legacy SessionStore for opencode when catalog has no match', async () => {
+    const h = await createHarness('opencode');
+    const cwdRealpath = await realpath(h.tmp.workspace);
+    h.sessions.set('chat-1', 'ses_legacy', cwdRealpath);
+
+    const run = await start(h);
+    expect(run.ok).toBe(true);
+    if (!run.ok) throw new Error('expected resumed legacy run');
+    expect(run.resumeFrom).toBe('ses_legacy');
+    expect(h.agent.runOptions[0]).toMatchObject({
+      sessionId: 'ses_legacy',
+      threadId: undefined,
+    });
+  });
+
+  it('records opencode system events into both catalog and legacy SessionStore', async () => {
+    const h = await createHarness('opencode');
+    const run = await start(h);
+    expect(run.ok).toBe(true);
+    if (!run.ok) throw new Error('expected initial run');
+    await collect(run.execution.subscribe());
+
+    recordRunSessionEvent({
+      scopeId: 'chat-1',
+      sessions: h.sessions,
+      sessionCatalog: h.catalog,
+      capability: opencodeCapability(h.profileConfig),
+      policy: run.policy,
+      event: { type: 'system', sessionId: 'ses_recorded', cwd: run.cwdRealpath },
+    });
+
+    expect(
+      h.catalog.activeFor({
+        scopeId: 'chat-1',
+        agentId: 'opencode',
+        cwdRealpath: run.cwdRealpath,
+        policyFingerprint: run.policy.policyFingerprint,
+      }),
+    ).toMatchObject({ sessionId: 'ses_recorded' });
+    expect(h.sessions.resumeFor('chat-1', run.cwdRealpath)).toBe('ses_recorded');
+  });
 });
 
-async function createHarness(agentKind: 'claude' | 'codex'): Promise<{
+async function createHarness(agentKind: 'claude' | 'codex' | 'opencode'): Promise<{
   tmp: TmpProfile;
   agent: FakeAgentAdapter;
   executor: RunExecutor;
@@ -247,7 +319,9 @@ async function start(h: Awaited<ReturnType<typeof createHarness>>) {
     capability:
       h.profileConfig.agentKind === 'codex'
         ? codexCapability(h.profileConfig)
-        : claudeCapability(h.profileConfig),
+        : h.profileConfig.agentKind === 'opencode'
+          ? opencodeCapability(h.profileConfig)
+          : claudeCapability(h.profileConfig),
     profileConfig: h.profileConfig,
     sessions: h.sessions,
     sessionCatalog: h.catalog,

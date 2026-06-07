@@ -7,7 +7,7 @@ export type AgentEvent =
   | { type: 'system'; sessionId?: string; threadId?: string; cwd?: string; model?: string }
   | { type: 'text'; delta: string }
   | { type: 'thinking'; delta: string }
-  | { type: 'tool_use'; id: string; name: string; input: unknown }
+  | { type: 'tool_use'; id: string; name: string; input: unknown; title?: string }
   | { type: 'tool_result'; id: string; output: string; isError: boolean }
   | {
       /**
@@ -71,6 +71,31 @@ export interface AgentRunOptions {
    * are adapter-specific.
   */
   stopGraceMs?: number;
+  /**
+   * Bridge scope this run belongs to (chatId for p2p/group, chatId:threadId
+   * for topic). opencode uses this to cache its per-session SSE driver so a
+   * follow-up `nextSpontaneousTurn(scope)` lands on the same opencode session
+   * that was dispatched here. Other adapters can ignore it.
+   */
+  scopeId?: string;
+}
+
+/**
+ * Adapters that support multi-turn per dispatch — opencode with
+ * oh-my-openagent's background-task wake-up flow is the canonical case.
+ *
+ * After the AgentRun returned by `run()` drains naturally (its terminal
+ * `done` arrives), the bridge can call `nextSpontaneousTurn(scopeId)` to wait
+ * for the agent to start a new turn on its own (because background work
+ * completed and the plugin injected a wake-up prompt into the same session).
+ *
+ * `closeSession` tears down the consumer for that scope — used by `/new`,
+ * `/reset`, and profile shutdown so we don't leak SSE subscriptions or let
+ * the agent burn cycles on a session nobody's listening to.
+ */
+export interface WakeUpCapableAdapter {
+  nextSpontaneousTurn(scopeId: string): Promise<AgentRun | null>;
+  closeSession(scopeId: string): Promise<void>;
 }
 
 export interface AgentRun {

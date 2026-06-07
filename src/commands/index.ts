@@ -4,7 +4,7 @@ import { homedir } from 'node:os';
 import { dirname, isAbsolute } from 'node:path';
 import type { LarkChannel, NormalizedMessage } from '@larksuiteoapi/node-sdk';
 import { claudeCapability, codexCapability, opencodeCapability } from '../agent/capability';
-import type { AgentAdapter } from '../agent/types';
+import type { AgentAdapter, WakeUpCapableAdapter } from '../agent/types';
 import type { ActiveRuns } from '../bot/active-runs';
 import {
   accountCurrentCard,
@@ -311,7 +311,26 @@ async function handleNew(args: string, ctx: CommandContext): Promise<void> {
     });
   }
   ctx.sessions.clear(ctx.scope);
+  await closeWakeUpSessionIfAny(ctx);
   await reply(ctx, wasRunning ? '已中断当前任务并开始新会话。' : '已开始新会话。');
+}
+
+/**
+ * For opencode profiles, tear down the cached SSE driver so a fresh session
+ * gets a fresh sessionId on the next user message. Otherwise the next
+ * `dispatchTurn` would reuse the old (now-archived) opencode session, and
+ * any background tasks oh-my-openagent still has running there would keep
+ * trying to wake it up — landing in a session the bridge has logically
+ * abandoned. No-op for other agent kinds.
+ */
+async function closeWakeUpSessionIfAny(ctx: CommandContext): Promise<void> {
+  const agent = ctx.agent as Partial<WakeUpCapableAdapter>;
+  if (typeof agent.closeSession !== 'function') return;
+  try {
+    await agent.closeSession(ctx.scope);
+  } catch (err) {
+    console.warn('[closeWakeUpSession] failed:', err);
+  }
 }
 
 async function handleNewChat(rawName: string, ctx: CommandContext): Promise<void> {
@@ -372,6 +391,7 @@ async function handleCd(args: string, ctx: CommandContext): Promise<void> {
   ctx.activeRuns.interrupt(ctx.scope);
   ctx.workspaces.setCwd(ctx.scope, workspace.cwdRealpath);
   ctx.sessions.clear(ctx.scope);
+  await closeWakeUpSessionIfAny(ctx);
   await reply(ctx, `✓ 已切换 cwd 到 \`${workspace.cwdRealpath}\`\n（session 已重置）`);
 }
 
@@ -437,6 +457,10 @@ async function handleWsUse(name: string, ctx: CommandContext): Promise<void> {
   ctx.activeRuns.interrupt(ctx.scope);
   ctx.workspaces.setCwd(ctx.scope, workspace.cwdRealpath);
   ctx.sessions.clear(ctx.scope);
+  // Same as /cd: drop the cached opencode SSE consumer or the next dispatch
+  // will throw `cwd mismatch` (consumer is pinned to the OLD cwd on first
+  // dispatch and refuses to re-bind to a new one).
+  await closeWakeUpSessionIfAny(ctx);
   await reply(ctx, `✓ 已切换到 \`${name}\` (${workspace.cwdRealpath})\n（session 已重置）`);
 }
 

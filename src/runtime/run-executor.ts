@@ -104,6 +104,10 @@ export class RunExecutor {
       sandbox: input.policy.sandbox,
       permissionMode: input.policy.permissionMode,
       stopGraceMs: input.stopGraceMs,
+      // opencode uses scopeId to cache its per-session SSE driver so
+      // wake-ups (oh-my-openagent background-task notifications) land back
+      // on the consumer the channel is listening to. Other adapters ignore.
+      scopeId: input.scopeId,
     };
     let run: AgentRun;
     try {

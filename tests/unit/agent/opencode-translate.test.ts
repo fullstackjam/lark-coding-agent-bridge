@@ -345,6 +345,112 @@ describe('Opencode event translator', () => {
         }),
       ).toEqual([{ type: 'tool_use', id: 't3', name: 'tool', input: {} }]);
     });
+
+    it('forwards toolTitle on the initial tool_use when opencode supplies state.title up front', () => {
+      const translator = new OpencodeEventTranslator();
+      expect(
+        translator.translate({
+          kind: 'part',
+          sessionID: 's',
+          messageID: 'm',
+          partID: 't-title',
+          partType: 'tool',
+          toolName: 'read',
+          toolState: 'running',
+          toolInput: { filePath: '/repo/foo.ts' },
+          toolTitle: 'Reading /repo/foo.ts',
+        }),
+      ).toEqual([
+        {
+          type: 'tool_use',
+          id: 't-title',
+          name: 'read',
+          input: { filePath: '/repo/foo.ts' },
+          title: 'Reading /repo/foo.ts',
+        },
+      ]);
+    });
+
+    it('re-emits a tool_use exactly once when state.title arrives after the first sighting', () => {
+      const translator = new OpencodeEventTranslator();
+      // First sighting: no title yet.
+      translator.translate({
+        kind: 'part',
+        sessionID: 's',
+        messageID: 'm',
+        partID: 't-late',
+        partType: 'tool',
+        toolName: 'bash',
+        toolState: 'pending',
+        toolInput: { command: 'ls' },
+      });
+      // Title appears mid-flight.
+      expect(
+        translator.translate({
+          kind: 'part',
+          sessionID: 's',
+          messageID: 'm',
+          partID: 't-late',
+          partType: 'tool',
+          toolName: 'bash',
+          toolState: 'running',
+          toolInput: { command: 'ls' },
+          toolTitle: 'List directory',
+        }),
+      ).toEqual([
+        {
+          type: 'tool_use',
+          id: 't-late',
+          name: 'bash',
+          input: { command: 'ls' },
+          title: 'List directory',
+        },
+      ]);
+      // Another update with title — no further tool_use.
+      expect(
+        translator.translate({
+          kind: 'part',
+          sessionID: 's',
+          messageID: 'm',
+          partID: 't-late',
+          partType: 'tool',
+          toolName: 'bash',
+          toolState: 'running',
+          toolInput: { command: 'ls' },
+          toolTitle: 'List directory',
+        }),
+      ).toEqual([]);
+    });
+
+    it('prefers toolOutput from state.output over text for tool_result', () => {
+      const translator = new OpencodeEventTranslator();
+      translator.translate({
+        kind: 'part',
+        sessionID: 's',
+        messageID: 'm',
+        partID: 't-out',
+        partType: 'tool',
+        toolName: 'bash',
+        toolState: 'pending',
+        toolInput: { command: 'echo hi' },
+      });
+      expect(
+        translator.translate({
+          kind: 'part',
+          sessionID: 's',
+          messageID: 'm',
+          partID: 't-out',
+          partType: 'tool',
+          toolName: 'bash',
+          toolState: 'completed',
+          // text is empty / wrong; opencode's real output lives in toolOutput.
+          text: '',
+          toolOutput: 'hi',
+        }),
+      ).toEqual([
+        { type: 'tool_result', id: 't-out', output: 'hi', isError: false },
+      ]);
+    });
   });
 
   describe('status', () => {

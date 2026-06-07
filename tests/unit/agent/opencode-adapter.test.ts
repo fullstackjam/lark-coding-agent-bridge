@@ -562,3 +562,167 @@ describe('OpencodeAdapter lifecycle', () => {
     expect(clientState.abortCalls).toEqual(['sess-A']);
   });
 });
+
+describe('OpencodeAdapter per-scope session cache', () => {
+  beforeEach(() => {
+    resetState();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it('reuses the cached consumer across two dispatches with the same scopeId', async () => {
+    // Manual-stream mode so we can emit `idle` per turn — the cached consumer
+    // reuses the same SSE stream, so the auto-emit-on-start default doesn't
+    // fire for the second turn.
+    streamState.scheduledStart = (stream) => {
+      stream.emit('event', { kind: 'connected' });
+      stream.emit('event', { kind: 'status', sessionID: 'sess-A', status: 'idle' });
+    };
+    const adapter = new OpencodeAdapter();
+    const run1 = adapter.run({
+      runId: 'r1',
+      prompt: 'first',
+      cwd: '/work',
+      scopeId: 'chat-1',
+    });
+    for await (const _ of run1.events) void _;
+
+    // Emit a fresh idle on the same (cached) stream so the second turn drains.
+    const sharedStream = streamState.instances[0]!;
+    setImmediate(() => {
+      sharedStream.emit('event', { kind: 'status', sessionID: 'sess-A', status: 'idle' });
+    });
+    const run2 = adapter.run({
+      runId: 'r2',
+      prompt: 'second',
+      cwd: '/work',
+      scopeId: 'chat-1',
+    });
+    for await (const _ of run2.events) void _;
+
+    // Cached consumer = one session = one createSession.
+    expect(clientState.createSessionCalls).toHaveLength(1);
+    // Two prompts on the same sessionId.
+    expect(clientState.promptCalls).toHaveLength(2);
+    expect(clientState.promptCalls[0]?.sessionId).toBe('sess-A');
+    expect(clientState.promptCalls[1]?.sessionId).toBe('sess-A');
+    // One stream — not re-created on the second dispatch.
+    expect(streamState.instances).toHaveLength(1);
+  });
+
+  it('uses separate consumers (and sessions) for different scopeIds', async () => {
+    const adapter = new OpencodeAdapter();
+    const run1 = adapter.run({
+      runId: 'r1',
+      prompt: 'a',
+      cwd: '/work',
+      scopeId: 'chat-A',
+    });
+    for await (const _ of run1.events) void _;
+    clientState.nextSessionId = 'sess-B';
+    const run2 = adapter.run({
+      runId: 'r2',
+      prompt: 'b',
+      cwd: '/work',
+      scopeId: 'chat-B',
+    });
+    for await (const _ of run2.events) void _;
+
+    expect(clientState.createSessionCalls).toHaveLength(2);
+  });
+
+  it('closeSession aborts the cached consumer and forgets it', async () => {
+    const adapter = new OpencodeAdapter();
+    const run = adapter.run({
+      runId: 'r1',
+      prompt: 'a',
+      cwd: '/work',
+      scopeId: 'chat-1',
+    });
+    for await (const _ of run.events) void _;
+    await adapter.closeSession('chat-1');
+    expect(clientState.abortCalls).toEqual(['sess-A']);
+
+    // Next dispatch for the same scope creates a NEW session — the consumer
+    // was forgotten, so a fresh stream + session gets minted.
+    clientState.nextSessionId = 'sess-fresh';
+    const run2 = adapter.run({
+      runId: 'r2',
+      prompt: 'after close',
+      cwd: '/work',
+      scopeId: 'chat-1',
+    });
+    for await (const _ of run2.events) void _;
+    expect(clientState.createSessionCalls).toHaveLength(2);
+    // Two streams (one per consumer); the first was closed by closeSession.
+    expect(streamState.instances).toHaveLength(2);
+  });
+
+  it('closeSession is a no-op when no consumer is cached for the scope', async () => {
+    const adapter = new OpencodeAdapter();
+    await expect(adapter.closeSession('never-dispatched')).resolves.toBeUndefined();
+    expect(clientState.abortCalls).toEqual([]);
+  });
+
+  it('nextSpontaneousTurn returns null when no consumer is cached', async () => {
+    const adapter = new OpencodeAdapter();
+    const turn = await adapter.nextSpontaneousTurn('never-dispatched');
+    expect(turn).toBeNull();
+  });
+
+  it('evicts a cached consumer whose SSE stream closed unexpectedly', async () => {
+    const adapter = new OpencodeAdapter();
+    // First dispatch sets up the consumer + stream. The default mock stream
+    // emits idle + close on start, so by the time the iterator drains the
+    // SSE has already been signalled `close` — this exercises the
+    // unexpected-close path (no /new, no closeSession, but stream is gone).
+    const run1 = adapter.run({
+      runId: 'r1',
+      prompt: 'first',
+      cwd: '/work',
+      scopeId: 'chat-evict',
+    });
+    for await (const _ of run1.events) void _;
+
+    // Second dispatch should NOT silently reuse the dead consumer — that
+    // path would queue a prompt with no live SSE reader and hang. Adapter
+    // must evict and create a fresh consumer + stream.
+    clientState.nextSessionId = 'sess-after-evict';
+    const run2 = adapter.run({
+      runId: 'r2',
+      prompt: 'second',
+      cwd: '/work',
+      scopeId: 'chat-evict',
+    });
+    for await (const _ of run2.events) void _;
+
+    // Fresh consumer = fresh createSession + fresh stream.
+    expect(clientState.createSessionCalls).toHaveLength(2);
+    expect(streamState.instances).toHaveLength(2);
+  });
+
+  it('closeAllSessions tears down every cached scope', async () => {
+    const adapter = new OpencodeAdapter();
+    const a = adapter.run({
+      runId: 'r1',
+      prompt: 'a',
+      cwd: '/work',
+      scopeId: 'chat-A',
+    });
+    for await (const _ of a.events) void _;
+    clientState.nextSessionId = 'sess-B';
+    const b = adapter.run({
+      runId: 'r2',
+      prompt: 'b',
+      cwd: '/work',
+      scopeId: 'chat-B',
+    });
+    for await (const _ of b.events) void _;
+
+    await adapter.closeAllSessions();
+    expect(clientState.abortCalls.sort()).toEqual(['sess-A', 'sess-B']);
+  });
+});

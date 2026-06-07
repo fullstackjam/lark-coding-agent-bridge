@@ -8,6 +8,8 @@ export interface ToolEntry {
   input: unknown;
   status: ToolStatus;
   output?: string;
+  /** Optional human-readable title from upstream (opencode populates this; Claude/Codex don't). */
+  title?: string;
 }
 
 export type Block =
@@ -71,11 +73,31 @@ export function reduce(state: RunState, evt: AgentEvent): RunState {
     }
 
     case 'tool_use': {
+      // Upsert by id: opencode can re-emit a tool_use for the same partID
+      // when state.title arrives late (the translator dedupes to at most
+      // one re-emit). Merging in place keeps the card from showing two
+      // entries for the same tool call.
+      const existingIdx = state.blocks.findIndex(
+        (b) => b.kind === 'tool' && b.tool.id === evt.id,
+      );
+      if (existingIdx >= 0) {
+        const existing = state.blocks[existingIdx] as Extract<Block, { kind: 'tool' }>;
+        const updated: ToolEntry = {
+          ...existing.tool,
+          name: evt.name,
+          input: evt.input,
+          ...(evt.title !== undefined ? { title: evt.title } : {}),
+        };
+        const blocks = [...state.blocks];
+        blocks[existingIdx] = { kind: 'tool', tool: updated };
+        return { ...state, blocks };
+      }
       const tool: ToolEntry = {
         id: evt.id,
         name: evt.name,
         input: evt.input,
         status: 'running',
+        ...(evt.title !== undefined ? { title: evt.title } : {}),
       };
       return {
         ...state,

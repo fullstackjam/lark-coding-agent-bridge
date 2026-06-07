@@ -5,19 +5,24 @@ import type {
 } from '@larksuiteoapi/node-sdk';
 import { Domain, LoggerLevel, createLarkChannel } from '@larksuiteoapi/node-sdk';
 import { dirname, join } from 'node:path';
-import { claudeCapability, codexCapability, opencodeCapability } from '../agent/capability';
+import {
+  claudeCapability,
+  codexCapability,
+  opencodeCapability,
+  type AgentCapability,
+} from '../agent/capability';
 import {
   buildAgentPrompt,
   type BridgePromptInteractiveCard,
   type BridgePromptMention,
   type BridgePromptQuotedMessage,
 } from '../agent/prompt';
-import type { AgentAdapter, AgentEvent } from '../agent/types';
+import type { AgentAdapter, AgentEvent, WakeUpCapableAdapter } from '../agent/types';
 import { handleCardAction } from '../card/dispatcher';
 import { CallbackAuth } from '../card/callback-auth';
 import { CallbackNonceStore } from '../card/callback-store';
 import { permissionCard } from '../card/permission-card';
-import { renderCard } from '../card/run-renderer';
+import { renderCard, type RunCardRenderOptions } from '../card/run-renderer';
 import {
   finalizeIfRunning,
   initialState,
@@ -45,7 +50,7 @@ import {
   toPromptAttachment,
 } from '../media/attachment';
 import { canUseDm, canUseGroup } from '../policy/access';
-import type { ScopeContext } from '../policy/run-policy';
+import type { RunPolicyAllow, ScopeContext } from '../policy/run-policy';
 import { createOwnerRefreshController, type OwnerRawClient } from '../policy/owner';
 import { RunExecutor } from '../runtime/run-executor';
 import type { SessionCatalog } from '../session/catalog';
@@ -68,6 +73,23 @@ import type { AppPaths } from '../config/app-paths';
 const DEBOUNCE_MS = 600;
 const STREAM_TERMINAL_GRACE_MS = 3000;
 const REACTION_CLEANUP_GRACE_MS = 1000;
+
+/**
+ * Per-scope wake-up watcher tracking. Set when a watcher is active so a
+ * follow-up `runAgentBatch` doesn't spawn a duplicate watcher for the same
+ * scope. Removed when the watcher exits (consumer closed, or stream died).
+ */
+const scopeWakeWatchers = new Map<string, Promise<void>>();
+
+function isWakeUpCapable(
+  agent: AgentAdapter,
+): agent is AgentAdapter & WakeUpCapableAdapter {
+  return (
+    typeof (agent as Partial<WakeUpCapableAdapter>).nextSpontaneousTurn ===
+      'function' &&
+    typeof (agent as Partial<WakeUpCapableAdapter>).closeSession === 'function'
+  );
+}
 
 const BRIDGE_AGENT_INSTRUCTIONS = [
   '你在 bridge 进程中运行，普通 lark-cli 会继承 LARK_CHANNEL=1 并进入 bridge-bound 模式。',
@@ -258,6 +280,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
         await runAgentBatch({
           channel,
           executor,
+          agent,
           sessions,
           sessionCatalog,
           workspaces,
@@ -268,6 +291,8 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           activePolicyFingerprints,
           scope,
           mode,
+          pending,
+          activeRuns,
         });
       } catch (err) {
         log.fail('flush', err);
@@ -422,9 +447,19 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       knownChatsRefresh.stop();
       keepalive.stop();
       pending.cancelAll();
-      const [disconnectResult, stopAllResult, ...flushResults] = await Promise.allSettled([
+      // Tear down any cached opencode session consumers — otherwise their SSE
+      // subscriptions stay open against the local opencode server even after
+      // the bridge has stopped talking to Lark, leaking file handles and
+      // letting oh-my-openagent keep injecting wake-ups into dead sessions.
+      const agentWithShutdown = agent as unknown as { closeAllSessions?: () => Promise<void> };
+      const closeWakeupSessions =
+        typeof agentWithShutdown.closeAllSessions === 'function'
+          ? agentWithShutdown.closeAllSessions()
+          : Promise.resolve();
+      const [disconnectResult, stopAllResult, , ...flushResults] = await Promise.allSettled([
         channel.disconnect(),
         activeRuns.stopAll(),
+        closeWakeupSessions,
         sessions.flush(),
         sessionCatalog?.flush(),
         callbackNonceStore?.flush(),
@@ -602,6 +637,9 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
 interface RunBatchDeps {
   channel: LarkChannel;
   executor: RunExecutor;
+  /** Agent adapter — needed at this level so we can detect wake-up capability
+   * and spawn the per-scope wake-up watcher after the run drains. */
+  agent: AgentAdapter;
   sessions: SessionStore;
   sessionCatalog?: SessionCatalog;
   workspaces: WorkspaceStore;
@@ -612,6 +650,17 @@ interface RunBatchDeps {
   activePolicyFingerprints: Map<string, string>;
   scope: string;
   mode: ChatMode;
+  /** PendingQueue from the channel — the wake-up watcher blocks it for the
+   * duration of each wake-up turn so a user message arriving mid-wake-up
+   * queues cleanly behind it instead of racing into a busy consumer and
+   * tripping `previous turn not consumed`. */
+  pending: PendingQueue;
+  /** ActiveRuns registry — wake-up turn handles get registered here so the
+   * card dispatcher's `verifyBridgeToken` (which looks up
+   * `activeRuns.get(scope)` for runId + interrupt) can validate stop /
+   * permission callbacks for wake-up cards too. Without registration the
+   * dispatcher rejects every callback as `missing-token-or-run`. */
+  activeRuns: ActiveRuns;
 }
 
 async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
@@ -956,7 +1005,327 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   } finally {
     activePolicyFingerprints.delete(scope);
     scheduleWorkingReactionCleanup(channel, lastMsg.messageId, reactionPromise);
+    // After the user-initiated turn drains, kick off a wake-up watcher (once
+    // per scope) so oh-my-openagent's background-task completions land back in
+    // the chat as fresh cards. Detached — runAgentBatch returns immediately.
+    if (
+      controls.profileConfig.agentKind === 'opencode' &&
+      isWakeUpCapable(deps.agent) &&
+      !scopeWakeWatchers.has(scope)
+    ) {
+      const watcher = watchScopeWakeups({
+        scope,
+        chatId,
+        ...(threadId ? { threadId } : {}),
+        mode,
+        agent: deps.agent,
+        channel,
+        controls,
+        ...(callbackAuth ? { callbackAuth } : {}),
+        operatorOpenId: firstMsg.senderId,
+        policyFingerprint: flow.policy.policyFingerprint,
+        pending: deps.pending,
+        activeRuns: deps.activeRuns,
+        activePolicyFingerprints,
+        sessions,
+        ...(sessionCatalog ? { sessionCatalog } : {}),
+        capability,
+        policy: flow.policy,
+      });
+      scopeWakeWatchers.set(scope, watcher);
+      void watcher
+        .catch((err) => log.fail('wake-up', err, { scope }))
+        .finally(() => scopeWakeWatchers.delete(scope));
+    }
   }
+}
+
+/**
+ * Long-lived per-scope watcher for opencode wake-up turns. Listens for new
+ * spontaneous turns from the cached session consumer and renders each as a
+ * fresh streaming card (mirrors the main user-turn render path).
+ *
+ * Two correctness contracts vs. the original final-only MVP:
+ *   1. **Streaming** — events flow into a card via the same processAgentStream
+ *      + channel.stream pipeline runAgentBatch uses, so the user sees the bot
+ *      working (tool calls, partial text) instead of a long silence + a
+ *      single dump at the end.
+ *   2. **Pending-queue lock** — while a wake-up turn is in flight, the
+ *      PendingQueue for this scope is `block()`ed. A user message that arrives
+ *      mid-wake-up queues into the next debounce window instead of racing
+ *      `consumer.dispatchTurn` (which would throw "previous turn not
+ *      consumed"). Released when the turn drains.
+ */
+async function watchScopeWakeups(opts: {
+  scope: string;
+  chatId: string;
+  threadId?: string;
+  mode: ChatMode;
+  agent: AgentAdapter & WakeUpCapableAdapter;
+  channel: LarkChannel;
+  controls: Controls;
+  callbackAuth?: CallbackAuth;
+  /** Captured at watcher-spawn time: whoever last sent a user message in this
+   * scope. Used as the operator for sign-callback (stop button on the wake-up
+   * card) and permission-card callbacks. */
+  operatorOpenId: string;
+  /** Policy fingerprint of the user run that spawned this watcher; the
+   * callback signer needs it so a stale signature gets rejected if policy
+   * changes mid-wake-up. */
+  policyFingerprint: string;
+  pending: PendingQueue;
+  activeRuns: ActiveRuns;
+  /** The `activePolicyFingerprints` map shared with the dispatcher's
+   * `verifyBridgeToken`. The watcher writes its current-turn fingerprint
+   * here so wake-up card callbacks (stop, permission) verify against the
+   * same value they were signed with. Cleared at turn-end so a future user
+   * run can take ownership again. */
+  activePolicyFingerprints: Map<string, string>;
+  sessions: SessionStore;
+  sessionCatalog?: SessionCatalog;
+  capability: AgentCapability;
+  /** The original user-turn policy, snapshotted at watcher-spawn time. We
+   * only need its cwdRealpath + policyFingerprint downstream
+   * (`recordRunSessionEvent` reads them), but typing it as the full
+   * `RunPolicyAllow` keeps us honest about where the values came from. */
+  policy: RunPolicyAllow;
+}): Promise<void> {
+  log.info('wake-up', 'watcher-start', { scope: opts.scope });
+  // Re-resolve idle timeout each loop so /timeout changes mid-flight take
+  // effect on the next wake-up turn.
+  const resolveIdleTimeoutMs = (): number | undefined => {
+    const scopeOverride = opts.sessions.getIdleTimeoutMinutes(opts.scope);
+    return scopeOverride !== undefined
+      ? scopeOverride > 0
+        ? scopeOverride * 60_000
+        : undefined
+      : getRunIdleTimeoutMs(opts.controls.cfg);
+  };
+  try {
+    while (true) {
+      const turn = await opts.agent.nextSpontaneousTurn(opts.scope);
+      if (!turn) {
+        log.info('wake-up', 'watcher-end', { scope: opts.scope, reason: 'consumer-closed' });
+        return;
+      }
+      log.info('wake-up', 'turn-received', { scope: opts.scope, runId: turn.runId });
+      // Lock pending-queue dispatch BEFORE the first event flows through. A
+      // user message debounce that's already armed will wait until we
+      // unblock; one arriving during the turn is buffered without firing.
+      opts.pending.block(opts.scope);
+      // Register the wake-up turn with ActiveRuns so the card dispatcher's
+      // `verifyBridgeToken` (which keys signed callbacks off
+      // `activeRuns.get(scope).run.runId`) can validate stop/permission
+      // clicks on the wake-up card. /stop typed by the user also routes
+      // through `activeRuns.interrupt(scope)` and only works if a handle is
+      // registered. Registration throws if a handle is already present —
+      // shouldn't happen since `pending.block` above + the consumer's
+      // serialized currentTurn invariant mean no user-turn is running, but
+      // if it does, surface and skip this wake-up rather than corrupt the
+      // registry.
+      let handle: RunHandle;
+      try {
+        handle = opts.activeRuns.register(opts.scope, turn);
+      } catch (err) {
+        log.warn('wake-up', 'activeRuns-register-collision', {
+          scope: opts.scope,
+          runId: turn.runId,
+          err: err instanceof Error ? err.message : String(err),
+        });
+        opts.pending.unblock(opts.scope);
+        // Drain the turn we already accepted to terminal so opencode doesn't
+        // sit blocked on our consumer's currentTurn handle forever. Just
+        // calling turn.stop() isn't enough — the iterator's `finally`
+        // (which sets currentTurn.finished and lets the consumer accept the
+        // next turn) only runs when someone iterates events to completion.
+        try {
+          await turn.stop();
+          // Best-effort drain; if turn.events surfaces an error we still
+          // need the iterator to fully run to set `finished`.
+          for await (const _ of turn.events) void _;
+        } catch {
+          /* best-effort */
+        }
+        continue;
+      }
+      // Publish our policy fingerprint into the dispatcher's lookup map so
+      // `verifyBridgeToken` checks signed wake-up card callbacks (stop +
+      // permission) against the same fingerprint they were signed with.
+      // Cleared in the finally below so the next user-run can take over.
+      // runAgentBatch's finally already removed the previous entry before
+      // spawning this watcher, so we're not stomping on any live owner.
+      opts.activePolicyFingerprints.set(opts.scope, opts.policyFingerprint);
+      const filterForPrefs = (state: RunState): RunState => {
+        if (getShowToolCalls(opts.controls.cfg)) return state;
+        return { ...state, blocks: state.blocks.filter((b) => b.kind !== 'tool') };
+      };
+      const cardRenderOptions: RunCardRenderOptions = {
+        headerBanner: '🔔 _后台任务完成后由 agent 主动接续_',
+        ...(opts.callbackAuth
+          ? {
+              signCallback: (action: string) =>
+                opts.callbackAuth!.sign({
+                  runId: turn.runId,
+                  scope: opts.scope,
+                  chatId: opts.chatId,
+                  operatorOpenId: opts.operatorOpenId,
+                  action,
+                  policyFingerprint: opts.policyFingerprint,
+                  ttlMs: 24 * 60 * 60 * 1000,
+                }),
+            }
+          : {}),
+      };
+      const sendOpts: { replyInThread?: boolean } = {};
+      if (opts.mode === 'topic' && opts.threadId) sendOpts.replyInThread = true;
+
+      const recordWakeUpSession = (evt: AgentEvent): void => {
+        // Same catalog/SessionStore wiring runAgentBatch uses — keeps the
+        // active sessionId pointer in step with whatever opencode returns
+        // on the system event of the wake-up turn (usually unchanged).
+        recordRunSessionEvent({
+          scopeId: opts.scope,
+          sessions: opts.sessions,
+          ...(opts.sessionCatalog ? { sessionCatalog: opts.sessionCatalog } : {}),
+          capability: opts.capability,
+          policy: opts.policy,
+          event: evt,
+        });
+      };
+
+      const sendPermissionCard = async (req: {
+        id: string;
+        tool: string;
+        input?: unknown;
+        description?: string;
+      }): Promise<void> => {
+        const card = permissionCard({
+          requestId: req.id,
+          tool: req.tool,
+          ...(req.input !== undefined ? { input: req.input } : {}),
+          ...(req.description !== undefined ? { description: req.description } : {}),
+          ...(opts.callbackAuth
+            ? {
+                signCallback: (action: string) =>
+                  opts.callbackAuth!.sign({
+                    runId: turn.runId,
+                    scope: opts.scope,
+                    chatId: opts.chatId,
+                    operatorOpenId: opts.operatorOpenId,
+                    action,
+                    policyFingerprint: opts.policyFingerprint,
+                    ttlMs: 24 * 60 * 60 * 1000,
+                  }),
+              }
+            : {}),
+        });
+        await opts.channel.send(opts.chatId, { card }, sendOpts);
+      };
+
+      try {
+        await renderWakeUpTurnAsCard({
+          handle,
+          channel: opts.channel,
+          chatId: opts.chatId,
+          sendOpts,
+          scope: opts.scope,
+          idleTimeoutMs: resolveIdleTimeoutMs(),
+          recordSession: recordWakeUpSession,
+          filterForPrefs,
+          cardRenderOptions,
+          sendPermissionCard,
+        });
+      } catch (err) {
+        log.fail('wake-up', err, { scope: opts.scope, runId: turn.runId });
+      } finally {
+        // Clear the dispatcher's fingerprint lookup before unregistering — a
+        // dangling entry would let a stale verify match if a click landed
+        // between unregister and delete.
+        opts.activePolicyFingerprints.delete(opts.scope);
+        // Unregister BEFORE unblocking pending — once pending is unblocked a
+        // queued user message may dispatch immediately and try to register a
+        // new run on the same scope; clearing the wake-up handle first
+        // avoids a `run already active` collision in `activeRuns.register`.
+        opts.activeRuns.unregister(opts.scope, turn);
+        opts.pending.unblock(opts.scope);
+      }
+    }
+  } catch (err) {
+    log.fail('wake-up', err, { scope: opts.scope });
+  }
+}
+
+/**
+ * Render one wake-up turn as a streaming card. Mirrors the card-mode branch
+ * of runAgentBatch's render path but with:
+ *   - no `replyTo` (wake-up isn't a reply to any specific user message)
+ *   - no working reaction (no user message to react to)
+ *   - a header banner identifying it as a bot-initiated continuation
+ */
+async function renderWakeUpTurnAsCard(opts: {
+  handle: RunHandle;
+  channel: LarkChannel;
+  chatId: string;
+  sendOpts: { replyInThread?: boolean };
+  scope: string;
+  idleTimeoutMs: number | undefined;
+  recordSession: (event: AgentEvent) => void;
+  filterForPrefs: (state: RunState) => RunState;
+  cardRenderOptions: RunCardRenderOptions;
+  sendPermissionCard: (req: {
+    id: string;
+    tool: string;
+    input?: unknown;
+    description?: string;
+  }) => Promise<void>;
+}): Promise<void> {
+  let latestState: RunState = initialState;
+  let producerStarted = false;
+  let cardCtrl:
+    | { update(next: object | ((current: object) => object)): Promise<void> }
+    | undefined;
+  const renderDone = processAgentStream(
+    opts.handle,
+    opts.handle.run.events,
+    opts.scope,
+    opts.idleTimeoutMs,
+    opts.recordSession,
+    async (state) => {
+      latestState = state;
+      if (cardCtrl) {
+        await cardCtrl.update(renderCard(opts.filterForPrefs(state), opts.cardRenderOptions));
+      }
+    },
+    opts.sendPermissionCard,
+  );
+  const streamDone = opts.channel.stream(
+    opts.chatId,
+    {
+      card: {
+        initial: renderCard(initialState, opts.cardRenderOptions),
+        producer: async (ctrl) => {
+          producerStarted = true;
+          cardCtrl = ctrl;
+          await ctrl.update(renderCard(opts.filterForPrefs(latestState), opts.cardRenderOptions));
+          await renderDone;
+        },
+      },
+    },
+    opts.sendOpts,
+  );
+  await awaitRenderAwareStream({
+    mode: 'card',
+    streamDone,
+    renderDone,
+    producerStarted: () => producerStarted,
+    fallback: async (state) => {
+      await opts.channel.send(
+        opts.chatId,
+        { card: renderCard(opts.filterForPrefs(state), opts.cardRenderOptions) },
+        opts.sendOpts,
+      );
+    },
+  });
 }
 
 /**

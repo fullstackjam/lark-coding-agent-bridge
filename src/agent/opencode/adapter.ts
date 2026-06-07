@@ -1,6 +1,5 @@
 import { log } from '../../core/logger';
 import { SpawnFailed } from '../../runtime/errors';
-import { buildBridgeSystemPrompt } from '../bridge-system-prompt';
 import { checkAgentAvailability, type AgentAvailability } from '../preflight';
 import type {
   AgentAdapter,
@@ -8,11 +7,11 @@ import type {
   AgentEvent,
   AgentRun,
   AgentRunOptions,
+  WakeUpCapableAdapter,
 } from '../types';
 import { OpencodeClient } from './client';
-import { OpencodeEventStream, type NormalizedEvent } from './events';
 import { OpencodeServer } from './server';
-import { OpencodeEventTranslator } from './translate';
+import { OpencodeSessionConsumer } from './session-consumer';
 
 export interface OpencodeAdapterOptions {
   binary?: string;
@@ -51,9 +50,20 @@ const DEFAULT_PERMISSION_TIMEOUT_MS = 5 * 60 * 1000;
  *    `session.status: idle`.
  *  - `stop` aborts the session over HTTP and closes the SSE stream.
  */
-export class OpencodeAdapter implements AgentAdapter {
+export class OpencodeAdapter implements AgentAdapter, WakeUpCapableAdapter {
   readonly id = 'opencode';
   readonly displayName = 'opencode';
+
+  /**
+   * Per-scope SSE driver cache. A scope = chatId for p2p / group; chatId
+   * with a thread suffix for topic groups. One opencode session, one
+   * long-lived SSE — so wake-ups from oh-my-openagent's background-task
+   * notifier land on the consumer the bridge is still listening to.
+   *
+   * Entries live until `closeSession(scope)` is called (which happens on
+   * `/new`, profile teardown, etc).
+   */
+  private readonly consumersByScope = new Map<string, OpencodeSessionConsumer>();
 
   private readonly binary: string;
   private readonly port: number;
@@ -135,329 +145,159 @@ export class OpencodeAdapter implements AgentAdapter {
   }
 
   run(opts: AgentRunOptions): AgentRun {
-    if (!opts.cwd) {
-      throw new Error('cwd is required for OpencodeAdapter.run');
+    // If scope is provided, use the cached consumer so wake-up turns land on
+    // the same SSE driver. Without scope (e.g. tests that don't thread it),
+    // fall back to a one-shot consumer — old behavior, no wake-up support.
+    if (opts.scopeId) {
+      const consumer = this.acquireConsumer(opts.scopeId);
+      const turn = consumer.dispatchTurn(opts);
+      // Do NOT closeStream on this turn's end — the consumer stays alive for
+      // wake-ups via `nextSpontaneousTurn(scopeId)`. The caller (channel) is
+      // responsible for explicit teardown via `closeSession(scopeId)`.
+      return wrapTurnWithoutSessionClose(turn);
     }
-
-    // opencode's `/session/{id}/prompt_async` accepts a top-level optional
-    // `system` string that gets appended to the model's system prompt array
-    // (see sst/opencode session/llm/request.ts). opencode reads the most
-    // recent user message's `system` per turn (`lastUser.system`), so we
-    // resend the bridge prompt on every prompt body — the string is
-    // deterministic per identity, so this is idempotent.
-    const bridgeSystemPrompt = buildBridgeSystemPrompt(this.botIdentity);
-
-    const cwd = opts.cwd;
-    const translator = new OpencodeEventTranslator({
-      cwd,
-      ...(opts.model ?? this.defaultModel
-        ? { model: opts.model ?? this.defaultModel }
-        : {}),
+    const consumer = new OpencodeSessionConsumer({
+      client: this.client,
+      serverBaseUrl: this.server.baseUrl,
+      defaultAgent: this.defaultAgent,
+      defaultModel: this.defaultModel,
+      defaultStopGraceMs: this.defaultStopGraceMs,
+      permissionTimeoutMs: this.permissionTimeoutMs,
+      botIdentity: this.botIdentity,
     });
-    const stream = new OpencodeEventStream({
-      baseUrl: this.server.baseUrl,
-      directory: cwd,
+    const turn = consumer.dispatchTurn(opts);
+    return wrapTurnWithConsumerCleanup(turn, consumer);
+  }
+
+  /**
+   * Wait for the next spontaneously-arriving turn on `scopeId` — a wake-up
+   * injected by oh-my-openagent's `notifyParentSession`. Resolves null if no
+   * cached consumer exists (caller never dispatched here) or if the consumer
+   * has been closed.
+   *
+   * Returned AgentRun's `stop()` only interrupts that turn; the consumer
+   * stays alive for further wake-ups. Use `closeSession(scopeId)` for full
+   * teardown.
+   */
+  async nextSpontaneousTurn(scopeId: string): Promise<AgentRun | null> {
+    const consumer = this.consumersByScope.get(scopeId);
+    if (!consumer) return null;
+    const turn = await consumer.nextSpontaneousTurn();
+    if (!turn) return null;
+    // Bare turn — same shape as turn from dispatchTurn, no extra cleanup
+    // wrappers. Multi-turn invariant: caller drains events before asking for
+    // the next one.
+    return turn;
+  }
+
+  /**
+   * Tear down the consumer for `scopeId`: abort in-flight message, abort
+   * opencode session, close SSE. Used by `/new`, `/reset`, profile shutdown.
+   * No-op if no consumer is cached for the scope.
+   */
+  async closeSession(scopeId: string): Promise<void> {
+    const consumer = this.consumersByScope.get(scopeId);
+    if (!consumer) return;
+    this.consumersByScope.delete(scopeId);
+    log.info('opencode.adapter', 'session-close', { scope: scopeId });
+    await consumer.close();
+  }
+
+  /** Test/runtime hook — close every cached consumer (bridge shutdown). */
+  async closeAllSessions(): Promise<void> {
+    const consumers = [...this.consumersByScope.entries()];
+    this.consumersByScope.clear();
+    await Promise.allSettled(
+      consumers.map(async ([scope, c]) => {
+        log.info('opencode.adapter', 'session-close', { scope, reason: 'shutdown' });
+        await c.close();
+      }),
+    );
+  }
+
+  private acquireConsumer(scopeId: string): OpencodeSessionConsumer {
+    const existing = this.consumersByScope.get(scopeId);
+    if (existing && !existing.isClosed()) return existing;
+    if (existing) {
+      // The cached consumer died (SSE dropped or explicitly closed) but the
+      // cache still holds a reference. Evict before creating a fresh one so
+      // a subsequent dispatch lands on a live stream.
+      this.consumersByScope.delete(scopeId);
+      log.info('opencode.adapter', 'session-evict-closed', { scope: scopeId });
+    }
+    const consumer = new OpencodeSessionConsumer({
+      client: this.client,
+      serverBaseUrl: this.server.baseUrl,
+      defaultAgent: this.defaultAgent,
+      defaultModel: this.defaultModel,
+      defaultStopGraceMs: this.defaultStopGraceMs,
+      permissionTimeoutMs: this.permissionTimeoutMs,
+      botIdentity: this.botIdentity,
     });
-    const stopGraceMs = opts.stopGraceMs ?? this.defaultStopGraceMs;
-    const permissionTimeoutMs = this.permissionTimeoutMs;
-
-    // We bridge SSE callbacks → an async iterator with a hand-rolled queue.
-    // Using EventEmitter directly would force a per-event `await new Promise`
-    // dance that loses ordering when many events land in the same tick.
-    const queue: NormalizedEvent[] = [];
-    const waiters: Array<() => void> = [];
-    let streamClosed = false;
-    let aborted = false;
-    let timedOut = false;
-    let runError: Error | null = null;
-    let runExited = false;
-    const exitWaiters: Array<() => void> = [];
-
-    // Track pending permission requests. The map carries the watchdog timer
-    // so respondToPermission() can clear it on a user-supplied answer;
-    // stop() iterates the keys to auto-reject everything outstanding.
-    interface PendingPermission {
-      timer: NodeJS.Timeout | null;
-      answered: boolean;
-    }
-    const pendingPermissions = new Map<string, PendingPermission>();
-
-    const pushNorm = (n: NormalizedEvent): void => {
-      queue.push(n);
-      const w = waiters.shift();
-      if (w) w();
-    };
-    const closeQueue = (): void => {
-      if (streamClosed) return;
-      streamClosed = true;
-      while (waiters.length > 0) {
-        const w = waiters.shift();
-        if (w) w();
-      }
-    };
-    const markExited = (): void => {
-      if (runExited) return;
-      runExited = true;
-      while (exitWaiters.length > 0) {
-        const w = exitWaiters.shift();
-        if (w) w();
-      }
-    };
-
-    stream.on('event', (n: NormalizedEvent) => pushNorm(n));
-    stream.on('close', () => closeQueue());
-
-    let sessionId = opts.sessionId;
-    const startedAt = Date.now();
-
-    // Kick off subscription + prompt asynchronously. Any error here ends
-    // the run with a synthetic error event so the async iterator below
-    // exits cleanly instead of stalling.
-    const startup = (async () => {
-      try {
-        await stream.start();
-        if (!sessionId) {
-          const created = await this.client.createSession(
-            buildSessionTitle(opts),
-            opts.cwd,
-          );
-          sessionId = created.id;
-          log.info('opencode.adapter', 'session-create', { sessionId });
-        } else {
-          log.info('opencode.adapter', 'session-reuse', { sessionId });
-        }
-        translator.setSessionId(sessionId);
-        await this.client.promptAsync({
-          sessionId,
-          parts: [{ type: 'text', text: opts.prompt }],
-          system: bridgeSystemPrompt,
-          ...(opts.model ?? this.defaultModel
-            ? { model: opts.model ?? this.defaultModel }
-            : {}),
-          ...(this.defaultAgent ? { agent: this.defaultAgent } : {}),
-        });
-        log.info('opencode.adapter', 'prompt-sent', {
-          sessionId,
-          promptChars: opts.prompt.length,
-        });
-      } catch (err) {
-        runError = err instanceof Error ? err : new Error(String(err));
-        log.fail('opencode.adapter', runError, { phase: 'startup' });
-        closeQueue();
-      }
-    })();
-
-    const adapterClient = this.client;
-
-    // Single funnel for answering a permission request. Idempotent: once a
-    // request has been answered (by user, by timeout, or by stop()), further
-    // calls are silent no-ops. Network errors on the reply RPC are logged
-    // but not propagated — the run can still progress when opencode's next
-    // SSE message arrives.
-    const sendPermissionReply = async (
-      requestId: string,
-      reply: 'once' | 'always' | 'reject',
-      source: 'user' | 'timeout' | 'stop',
-    ): Promise<void> => {
-      const pending = pendingPermissions.get(requestId);
-      if (pending?.answered) return;
-      if (pending) {
-        pending.answered = true;
-        if (pending.timer) clearTimeout(pending.timer);
-        pending.timer = null;
-      } else {
-        pendingPermissions.set(requestId, { timer: null, answered: true });
-      }
-      log.info('opencode.adapter', 'permission-reply', {
-        sessionId,
-        requestId,
-        reply,
-        source,
-      });
-      try {
-        await adapterClient.replyPermission(requestId, reply, cwd);
-      } catch (err) {
-        log.warn('opencode.adapter', 'permission-reply-failed', {
-          sessionId,
-          requestId,
-          source,
-          err: err instanceof Error ? err.message : String(err),
-        });
-      }
-    };
-
-    return {
-      runId: opts.runId,
-      events: createEventStream(),
-      async stop() {
-        if (aborted) return;
-        aborted = true;
-        // Pending permission requests: auto-reject before tearing down the
-        // SSE / session so opencode can actually emit its terminal event
-        // instead of sitting indefinitely on an un-answered prompt.
-        const pendingIds = [...pendingPermissions.entries()]
-          .filter(([, p]) => !p.answered)
-          .map(([id]) => id);
-        if (pendingIds.length > 0) {
-          log.info('opencode.adapter', 'stop-reject-pending', {
-            sessionId,
-            count: pendingIds.length,
-          });
-          await Promise.allSettled(
-            pendingIds.map((id) => sendPermissionReply(id, 'reject', 'stop')),
-          );
-        }
-        log.info('opencode.adapter', 'stop', {
-          sessionId,
-          graceMs: stopGraceMs,
-        });
-        try {
-          if (sessionId) {
-            await Promise.race([
-              adapterClient.abortSession(sessionId),
-              new Promise<void>((resolve) => setTimeout(resolve, stopGraceMs)),
-            ]);
-          }
-        } finally {
-          stream.close();
-          closeQueue();
-          markExited();
-        }
-      },
-      waitForExit(timeoutMs: number): Promise<boolean> {
-        if (runExited) return Promise.resolve(true);
-        return new Promise<boolean>((resolve) => {
-          const timer = setTimeout(() => {
-            const idx = exitWaiters.indexOf(onExit);
-            if (idx >= 0) exitWaiters.splice(idx, 1);
-            resolve(false);
-          }, timeoutMs);
-          const onExit = (): void => {
-            clearTimeout(timer);
-            resolve(true);
-          };
-          exitWaiters.push(onExit);
-        });
-      },
-      async respondToPermission(
-        requestId: string,
-        reply: 'once' | 'always' | 'reject',
-      ): Promise<void> {
-        // Idempotent: if the run is over (aborted, exited) or the request
-        // was already answered (timeout, double-click) silently no-op.
-        if (runExited || aborted) {
-          log.info('opencode.adapter', 'permission-reply-after-end', {
-            sessionId,
-            requestId,
-            reply,
-          });
-          return;
-        }
-        await sendPermissionReply(requestId, reply, 'user');
-      },
-    };
-
-    function armPermissionWatchdog(requestId: string): void {
-      if (permissionTimeoutMs <= 0) {
-        pendingPermissions.set(requestId, { timer: null, answered: false });
-        return;
-      }
-      const existing = pendingPermissions.get(requestId);
-      if (existing?.answered) return;
-      if (existing?.timer) clearTimeout(existing.timer);
-      const timer = setTimeout(() => {
-        log.warn('opencode.adapter', 'permission-timeout', {
-          sessionId,
-          requestId,
-          timeoutMs: permissionTimeoutMs,
-        });
-        // The reply RPC is best-effort: even if opencode swallows it (network
-        // glitch, server bug), the run MUST still end. Mark the run as
-        // timed-out, tear the SSE down the same way stop() does, and let the
-        // iterator's terminal block synthesise the `done` + 'timeout' event.
-        timedOut = true;
-        void sendPermissionReply(requestId, 'reject', 'timeout');
-        stream.close();
-        closeQueue();
-      }, permissionTimeoutMs);
-      // Don't keep the Node event loop alive solely on this timer — the
-      // SSE pump is the real liveness gate.
-      if (typeof timer.unref === 'function') timer.unref();
-      pendingPermissions.set(requestId, { timer, answered: false });
-    }
-
-    async function* createEventStream(): AsyncGenerator<AgentEvent> {
-      // Wait for startup to either succeed or fail before yielding anything;
-      // this guarantees the synthetic `system` event we may emit on
-      // `connected` carries the resolved sessionId.
-      try {
-        await startup;
-        // If `connected` already landed in the queue before startup
-        // resolved, the translator will fire the `system` event now with
-        // the freshly-set sessionId.
-        while (true) {
-          if (queue.length === 0) {
-            if (streamClosed) break;
-            await new Promise<void>((resolve) => waiters.push(resolve));
-            continue;
-          }
-          const evt = queue.shift()!;
-          for (const out of translator.translate(evt)) {
-            if (out.type === 'permission_request') {
-              armPermissionWatchdog(out.id);
-            }
-            yield out;
-          }
-          if (translator.isFinished()) break;
-        }
-        if (!translator.isFinished()) {
-          if (runError) {
-            for (const out of translator.finishWith('failed', runError.message)) {
-              yield out;
-            }
-          } else if (timedOut) {
-            // Permission watchdog fired and tore the stream down. Surface a
-            // terminal `done` with `terminationReason: 'timeout'` so the run
-            // ends on its own, independent of whatever opencode does (or
-            // doesn't) emit downstream of the auto-reject.
-            for (const out of translator.finishWith('timeout')) yield out;
-          } else if (aborted) {
-            for (const out of translator.finishWith('interrupted')) yield out;
-          } else {
-            // Stream closed without `status: idle` and no explicit error —
-            // treat as a generic failure so callers don't hang.
-            for (const out of translator.finishWith(
-              'failed',
-              'opencode SSE stream closed unexpectedly',
-            )) {
-              yield out;
-            }
-          }
-        }
-      } finally {
-        // Cancel any pending permission watchdogs so they don't fire after
-        // the run has already ended (and don't keep the loop alive).
-        for (const pending of pendingPermissions.values()) {
-          if (pending.timer) {
-            clearTimeout(pending.timer);
-            pending.timer = null;
-          }
-        }
-        stream.close();
-        markExited();
-        log.info('opencode.adapter', 'run-end', {
-          sessionId,
-          durationMs: Date.now() - startedAt,
-        });
-      }
-    }
+    this.consumersByScope.set(scopeId, consumer);
+    log.info('opencode.adapter', 'session-open', { scope: scopeId });
+    return consumer;
   }
 }
 
-function buildSessionTitle(opts: AgentRunOptions): string {
-  // Match opencode's TUI convention: short, prompt-derived title so an
-  // operator browsing `opencode serve`'s session list can recognise the run.
-  const head = opts.prompt.trim().split(/\s+/).slice(0, 8).join(' ');
-  if (!head) return `bridge ${opts.runId.slice(0, 8)}`;
-  return head.length > 64 ? `${head.slice(0, 61)}...` : head;
+/**
+ * Wrap a per-turn AgentRun so the channel sees a normal terminal `done` but
+ * we do NOT teardown the consumer when the iterable drains — the consumer
+ * lives on to deliver wake-up turns. `stop()` still aborts the in-flight
+ * message (turn-level abort) and lets the iterable surface 'interrupted'.
+ */
+function wrapTurnWithoutSessionClose(turn: AgentRun): AgentRun {
+  return {
+    runId: turn.runId,
+    events: turn.events,
+    stop: turn.stop.bind(turn),
+    waitForExit: turn.waitForExit.bind(turn),
+    ...(turn.respondToPermission
+      ? {
+          respondToPermission: turn.respondToPermission.bind(turn),
+        }
+      : {}),
+  };
+}
+
+function wrapTurnWithConsumerCleanup(
+  turn: AgentRun,
+  consumer: OpencodeSessionConsumer,
+): AgentRun {
+  let streamClosed = false;
+  // Use `closeStream`, NOT `close`. The turn's own stop() already aborts the
+  // in-flight message via the consumer's dedup'd abort helper. Calling the
+  // full `close()` here would also fire `abortSession` a second time — and
+  // worse, would do so on a naturally-ended turn (when stop was never called)
+  // which manifests as a spurious abort RPC vs. the pre-consumer adapter
+  // contract.
+  const closeStreamOnce = async (): Promise<void> => {
+    if (streamClosed) return;
+    streamClosed = true;
+    await consumer.closeStream().catch(() => {});
+  };
+  const wrapEvents = async function* (): AsyncGenerator<AgentEvent> {
+    try {
+      for await (const evt of turn.events) yield evt;
+    } finally {
+      await closeStreamOnce();
+    }
+  };
+  return {
+    runId: turn.runId,
+    events: wrapEvents(),
+    async stop() {
+      try {
+        await turn.stop();
+      } finally {
+        await closeStreamOnce();
+      }
+    },
+    waitForExit: turn.waitForExit.bind(turn),
+    async respondToPermission(requestId, reply) {
+      if (turn.respondToPermission) {
+        await turn.respondToPermission(requestId, reply);
+      }
+    },
+  };
 }

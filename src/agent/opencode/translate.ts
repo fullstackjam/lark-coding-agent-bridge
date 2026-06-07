@@ -10,6 +10,7 @@ import type { NormalizedEvent } from './events';
  */
 export class OpencodeEventTranslator {
   private toolUseEmitted = new Set<string>();
+  private toolUseTitleEmitted = new Set<string>();
   private toolResultEmitted = new Set<string>();
   // opencode persists the prompt as a user message and broadcasts
   // `message.part.updated` for its text part too, so without this filter
@@ -152,11 +153,27 @@ export class OpencodeEventTranslator {
       const state = evt.toolState;
       if (!this.toolUseEmitted.has(evt.partID)) {
         this.toolUseEmitted.add(evt.partID);
+        if (evt.toolTitle !== undefined) this.toolUseTitleEmitted.add(evt.partID);
         out.push({
           type: 'tool_use',
           id: evt.partID,
           name: evt.toolName ?? 'tool',
           input: evt.toolInput ?? {},
+          ...(evt.toolTitle !== undefined ? { title: evt.toolTitle } : {}),
+        });
+      } else if (evt.toolTitle !== undefined && !this.toolUseTitleEmitted.has(evt.partID)) {
+        // opencode often fills `state.title` only after the tool starts running.
+        // Re-emit a `tool_use` carrying the title so the card header can
+        // upgrade from "✅ read" to "✅ read — Reading src/foo.ts". Reducer
+        // merges by id (run-state.reduce), so this updates in place rather
+        // than duplicating. Dedupe via toolUseTitleEmitted: at most once.
+        this.toolUseTitleEmitted.add(evt.partID);
+        out.push({
+          type: 'tool_use',
+          id: evt.partID,
+          name: evt.toolName ?? 'tool',
+          input: evt.toolInput ?? {},
+          title: evt.toolTitle,
         });
       }
       if (state === 'completed' || state === 'error') {
@@ -165,7 +182,7 @@ export class OpencodeEventTranslator {
           out.push({
             type: 'tool_result',
             id: evt.partID,
-            output: evt.text ?? '',
+            output: evt.toolOutput ?? evt.text ?? '',
             isError: state === 'error',
           });
         }
