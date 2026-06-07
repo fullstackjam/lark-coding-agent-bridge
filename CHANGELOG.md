@@ -18,6 +18,7 @@ Upstream history is not duplicated here; consult [the upstream repo](https://git
 - **`PendingQueue.block/unblock` refcounted** so the wake-up watcher's block survives the surrounding user-run's unblock, preventing user messages from racing with an active wake-up turn.
 - **Tool render reads opencode's `state.{input,output,title}`** instead of bare `part.input/text`. Tool cards now show `✅ read — src/foo.ts` / `✅ bash — pnpm test` instead of bare `✅ read`. Case-insensitive switch + camelCase fallbacks (`filePath`) + opencode-native names (`todowrite`, `ast_grep_search`, etc.). `state.title` preferred over manual field probing when present.
 - **Documentation**: README adds opencode alongside Claude / Codex in installation, profiles, and CLI usage.
+- **Workbench group owners** (separate feature set, co-authored with Sisyphus): per-chat `workbench_owners` tracked in the profile config + persisted via a new command path; owner-only triggers in the bot channel gate certain workbench actions. See `src/config/profile-schema.ts`, `src/commands/index.ts`, `src/bot/channel.ts` and the new `tests/integration/bot/workbench-trigger.test.ts`.
 
 ### Fixed
 - **`session.permission_request` callbacks for wake-up turns**. Wake-up turn handles are registered in `ActiveRuns`, and the watcher publishes its policy fingerprint into `activePolicyFingerprints` for the turn's lifetime — without this, signed stop / permission card callbacks for wake-up cards were rejected by `verifyBridgeToken` with `missing-token-or-run` or fingerprint-mismatch.
