@@ -7,6 +7,31 @@ This is a private fork of [zarazhangrui/lark-coding-agent-bridge](https://github
 
 Upstream history is not duplicated here; consult [the upstream repo](https://github.com/zarazhangrui/lark-coding-agent-bridge/commits/main) for changes inherited at fork time.
 
+## [0.3.0] - 2026-06-07
+
+### Added
+- **Persistent opencode sessions across user turns**. `run-flow.ts` now resolves opencode `sessionId` from the catalog + `SessionStore` (same flow as Claude); `recordRunSessionEvent` writes it back on the synthetic `system` event. Before this, every user message minted a brand new opencode session — agent context was lost between turns even though opencode supports session-scoped chat.
+- **Wake-up card rendering for oh-my-openagent background tasks**. When the plugin's `notifyParentSession` injects a synthetic `[BACKGROUND TASK RESULT READY]` user message into the parent session via `promptAsync`, the bridge surfaces the agent's follow-up as a fresh streaming card with a `🔔 后台任务完成后由 agent 主动接续` header banner. Uses the same `processAgentStream + channel.stream` pipeline as user-initiated turns (streaming text + tool cards + permission prompts + signed stop button), not a final-only dump.
+- **`OpencodeSessionConsumer`** (new `src/agent/opencode/session-consumer.ts`). Owns one long-lived SSE subscription per chat scope and routes events to either the active user turn (`dispatchTurn`) or a wake-up turn (`nextSpontaneousTurn`). Events arriving between turns are buffered, including any that land in the gap between `status: idle` and the renderer finishing its Lark API round-trip.
+- **`OpencodeAdapter.acquireConsumer(scope)`** caches consumers per `AgentRunOptions.scopeId` (new optional field). `closeSession(scope)` and `closeAllSessions()` tear them down. `/new`, `/reset`, `/cd`, `/ws use`, and bridge disconnect all close the cached consumer so the next message starts fresh.
+- **`WakeUpCapableAdapter`** interface (duck-typed in the channel). Claude/Codex don't implement it and keep the one-shot adapter path; only opencode runs the wake-up watcher.
+- **`PendingQueue.block/unblock` refcounted** so the wake-up watcher's block survives the surrounding user-run's unblock, preventing user messages from racing with an active wake-up turn.
+- **Tool render reads opencode's `state.{input,output,title}`** instead of bare `part.input/text`. Tool cards now show `✅ read — src/foo.ts` / `✅ bash — pnpm test` instead of bare `✅ read`. Case-insensitive switch + camelCase fallbacks (`filePath`) + opencode-native names (`todowrite`, `ast_grep_search`, etc.). `state.title` preferred over manual field probing when present.
+- **Documentation**: README adds opencode alongside Claude / Codex in installation, profiles, and CLI usage.
+
+### Fixed
+- **`session.permission_request` callbacks for wake-up turns**. Wake-up turn handles are registered in `ActiveRuns`, and the watcher publishes its policy fingerprint into `activePolicyFingerprints` for the turn's lifetime — without this, signed stop / permission card callbacks for wake-up cards were rejected by `verifyBridgeToken` with `missing-token-or-run` or fingerprint-mismatch.
+- **`abortSession` dedupe resets per turn**. The `sessionAborted` flag was set once and held for the consumer's life; the second `/stop` (and every wake-up turn after the first) silently no-op'd the abort RPC.
+- **SSE events filtered by sessionID** in `onSseEvent`. opencode's `/event?directory=...` is directory-scoped, so sibling consumers on the same `cwd` would see each other's tool calls and `status: idle`. The filter drops events tagged with another session's ID.
+- **Consumer marked closed on unexpected SSE drop / start failure**. The adapter's cache evicts closed consumers on next `acquireConsumer`, so a transient opencode 5xx during stream start doesn't permanently poison the scope until `/new`.
+- **`stream.start()` deferred until after `createSession` + `setSessionId`**. Otherwise the `connected` → `system` event raced ahead and shipped without `sessionId`, leaving the catalog with no resume key.
+- **`handle.finished` set synchronously before yielding terminal `done`**. The iterator pauses at `yield` while the renderer awaits Lark; wake-up events arriving during that gap were being routed into the dead turn's queue and silently dropped.
+- **Permission-timeout closes the SSE stream**. opencode's trailing `status: idle` after the auto-reject was being promoted to a bogus empty wake-up card.
+- **Wake-up `activeRuns.register` collision path drains the iterator** after `turn.stop()` so the consumer's `currentTurn.finished` actually flips — without the drain the consumer stayed permanently busy.
+
+### Tests
+- 26 new tests covering the consumer's multi-turn behavior, SSE filtering, race conditions, the adapter's per-scope cache, opencode session persistence via run-flow, and the `PendingQueue` refcounting (589 total, up from 563).
+
 ## [0.2.1] - 2026-06-07
 
 ### Fixed
