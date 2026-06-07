@@ -88,6 +88,14 @@ export class OpencodeSessionConsumer {
   /** True once SSE has emitted `connected` at least once. We then synthesize
    * one per turn so each turn's translator can emit a `system` header. */
   private sawConnected = false;
+  /** Every messageID we've ever routed (current turn or spontaneous buffer).
+   * opencode re-broadcasts a final `message.updated` (with token stats /
+   * completion time) for both the user prompt AND the assistant reply AFTER
+   * `status: idle`; those re-broadcasts carry already-seen messageIDs and
+   * must not be promoted into a new spontaneous turn. A real wake-up
+   * (`promptAsync` injecting a synthetic user message) always carries a
+   * brand-new messageID. */
+  private seenMessageIds = new Set<string>();
 
   constructor(deps: OpencodeSessionConsumerDeps) {
     this.deps = deps;
@@ -325,6 +333,17 @@ export class OpencodeSessionConsumer {
       if (evtSessionId !== this.sessionId) return;
     }
     if (n.kind === 'connected') this.sawConnected = true;
+
+    // Compute "is this a never-before-seen message?" BEFORE marking the
+    // messageID as seen so the check works on the very first event for it.
+    const isNewMessage = n.kind === 'message' && !this.seenMessageIds.has(n.messageID);
+    // Remember every messageID that crosses the consumer so we can tell a
+    // real wake-up (new messageID) from a trailing re-broadcast of an
+    // already-seen message after `status: idle`.
+    if (n.kind === 'message' || n.kind === 'part') {
+      this.seenMessageIds.add(n.messageID);
+    }
+
     if (this.currentTurn && !this.currentTurn.finished) {
       this.currentTurn.feed(n);
       return;
@@ -338,18 +357,17 @@ export class OpencodeSessionConsumer {
     //
     // A real wake-up (oh-my-openagent's `notifyParentSession` calling
     // `session.promptAsync`) always begins with a `message.updated` event
-    // (the synthetic user message it injects). opencode also emits trailing
-    // housekeeping events after a `status: idle` for a tool-call-finished
-    // turn — late `part.updated` snapshots, an internal `status: running` /
-    // `status: idle` pair before the agent auto-continues, etc. If we promote
-    // those into a "spontaneous turn", the wake-up watcher renders an empty
-    // card stuck on "🧠 正在思考" because the buffer never contains anything
-    // user-visible.
+    // for a brand-new messageID (the synthetic user message it injects).
+    // opencode also emits trailing housekeeping events after `status: idle`
+    // for the just-ended turn: late `part.updated` snapshots and a final
+    // `message.updated` for both the user prompt and the assistant reply
+    // (final token stats / completion time). Those re-broadcasts carry
+    // messageIDs we already saw, so checking `kind === 'message'` alone is
+    // not enough — we filter by "have we ever seen this messageID before?".
     //
-    // Filter: only START a spontaneous buffer when the first event is a
-    // `message.updated`. Once buffering, accept everything (the rest of the
-    // turn's stream is parts + statuses).
-    const startsNewTurn = n.kind === 'message';
+    // Once a buffer is open we accept everything that follows (parts +
+    // statuses for the wake-up turn).
+    const startsNewTurn = isNewMessage;
     const hasOngoingBuffer = this.pendingSpontaneousEvents.length > 0;
     if (!startsNewTurn && !hasOngoingBuffer) return;
 

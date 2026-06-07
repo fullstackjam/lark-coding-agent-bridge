@@ -622,6 +622,87 @@ describe('OpencodeSessionConsumer — multi-turn behavior', () => {
     expect((text as { type: 'text'; delta: string }).delta).toBe('real wake-up');
   });
 
+  it('does not promote a trailing re-broadcast of an already-seen message into a wake-up', async () => {
+    // Regression for the live-fire bug we shipped 0.3.1 trying to fix and
+    // didn't: opencode emits a final `message.updated` for BOTH the user
+    // prompt and the assistant reply AFTER `status: idle`, carrying the
+    // same messageIDs the turn already streamed (now with completion stats /
+    // final token counts). 0.3.1's filter was "kind === 'message' starts a
+    // turn" — so these re-broadcasts opened an empty wake-up card. The
+    // fix tracks every messageID the consumer has ever routed and only
+    // promotes message events with a never-before-seen messageID.
+    const stream = new FakeStream();
+    const { client } = makeFakeClient('ses_rebroadcast');
+    const consumer = makeConsumer(stream, client);
+    const turn = consumer.dispatchTurn({
+      runId: 'r1',
+      prompt: 'hi',
+      cwd: '/repo',
+    });
+    await waitForSession(consumer);
+    stream.push({ kind: 'connected' });
+    stream.push({
+      kind: 'message',
+      sessionID: 'ses_rebroadcast',
+      messageID: 'msg_user',
+      role: 'user',
+    });
+    stream.push({
+      kind: 'message',
+      sessionID: 'ses_rebroadcast',
+      messageID: 'msg_asst',
+      role: 'assistant',
+    });
+    stream.push({
+      kind: 'part',
+      sessionID: 'ses_rebroadcast',
+      messageID: 'msg_asst',
+      partID: 'p1',
+      partType: 'text',
+      delta: '在。',
+    });
+    stream.push({ kind: 'status', sessionID: 'ses_rebroadcast', status: 'idle' });
+    await drain(turn.events);
+
+    // Re-broadcasts after idle — same messageIDs, no new content.
+    stream.push({
+      kind: 'message',
+      sessionID: 'ses_rebroadcast',
+      messageID: 'msg_user',
+      role: 'user',
+    });
+    stream.push({
+      kind: 'message',
+      sessionID: 'ses_rebroadcast',
+      messageID: 'msg_asst',
+      role: 'assistant',
+    });
+
+    // Watcher must block — these are not a wake-up.
+    const wakeP = consumer.nextSpontaneousTurn();
+    const raceWinner = await Promise.race([
+      wakeP.then(() => 'wake'),
+      new Promise<'timeout'>((r) => setTimeout(() => r('timeout'), 50)),
+    ]);
+    expect(raceWinner).toBe('timeout');
+
+    // A real wake-up (new messageID) does resolve it.
+    stream.push({
+      kind: 'message',
+      sessionID: 'ses_rebroadcast',
+      messageID: 'msg_wake_user',
+      role: 'user',
+    });
+    stream.push({
+      kind: 'status',
+      sessionID: 'ses_rebroadcast',
+      status: 'idle',
+    });
+    const wakeTurn = await wakeP;
+    expect(wakeTurn).not.toBeNull();
+    await drain(wakeTurn!.events);
+  });
+
   it('the second turn can also abort upstream (sessionAborted dedupe resets per turn)', async () => {
     const stream = new FakeStream();
     const { client, calls } = makeFakeClient('ses_twin');
