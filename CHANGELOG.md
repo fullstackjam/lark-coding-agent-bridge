@@ -7,10 +7,15 @@ This is a private fork of [zarazhangrui/lark-coding-agent-bridge](https://github
 
 Upstream history is not duplicated here; consult [the upstream repo](https://github.com/zarazhangrui/lark-coding-agent-bridge/commits/main) for changes inherited at fork time.
 
+## [0.3.2] - 2026-06-07
+
+### Fixed
+- **Bogus empty wake-up card after every turn (not just tool-call turns)**. 0.3.1 tried to fix this by requiring the first post-idle event to be a `message.updated`, but opencode emits a final `message.updated` for BOTH the user prompt AND the assistant reply AFTER `status: idle` — re-broadcasting completion stats / token counts for messageIDs the turn already streamed. Those re-broadcasts satisfied the `kind === 'message'` filter and still surfaced as empty wake-up cards. The consumer now tracks every messageID it routes (current-turn feeds + spontaneous buffers) and only promotes a `message.updated` whose messageID has never been seen before. A real oh-my-openagent wake-up via `promptAsync` always injects a fresh messageID; the trailing re-broadcasts never do.
+
 ## [0.3.1] - 2026-06-07
 
 ### Fixed
-- **Bogus empty wake-up card after a tool-call turn**. opencode emits trailing housekeeping events (a late `part.updated` snapshot, an internal `status: running` → `status: idle` pair before auto-continuing) after the `status: idle` that ends a tool-call-finished turn. The wake-up watcher was promoting those events into a "spontaneous turn" and rendering an empty card stuck on `🧠 正在思考` because the buffer never contained any user-visible content. The consumer now only starts a spontaneous buffer when the first post-idle event is a `message.updated` — the actual signal that a new turn began. Once buffering, the rest of the turn's stream (parts + statuses) is accepted normally.
+- **Bogus empty wake-up card after a tool-call turn** (incomplete fix — superseded by 0.3.2). opencode emits trailing housekeeping events (a late `part.updated` snapshot, an internal `status: running` → `status: idle` pair before auto-continuing) after the `status: idle` that ends a tool-call-finished turn. The wake-up watcher was promoting those events into a "spontaneous turn" and rendering an empty card stuck on `🧠 正在思考` because the buffer never contained any user-visible content. The consumer now only starts a spontaneous buffer when the first post-idle event is a `message.updated` — the actual signal that a new turn began. Once buffering, the rest of the turn's stream (parts + statuses) is accepted normally.
 
 ## [0.3.0] - 2026-06-07
 
