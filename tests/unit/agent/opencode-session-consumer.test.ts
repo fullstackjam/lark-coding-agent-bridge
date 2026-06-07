@@ -550,6 +550,78 @@ describe('OpencodeSessionConsumer — multi-turn behavior', () => {
     expect(consumer.isClosed()).toBe(true);
   });
 
+  it('does not promote trailing status/part events after idle into a bogus wake-up turn', async () => {
+    // Regression for a live-fire bug: opencode emits trailing housekeeping
+    // events after a tool-call-finished `status: idle` (late `part.updated`
+    // snapshots, an internal status:running/idle pair before auto-continuing,
+    // etc). Before this fix, those events buffered into pendingSpontaneous
+    // and the wake-up watcher rendered them as a turn — an empty card stuck
+    // on "🧠 正在思考" because no message.updated → no system event for the
+    // translator → no done event.
+    const stream = new FakeStream();
+    const { client } = makeFakeClient('ses_tail');
+    const consumer = makeConsumer(stream, client);
+    const turn = consumer.dispatchTurn({
+      runId: 'r1',
+      prompt: 'go',
+      cwd: '/repo',
+    });
+    await waitForSession(consumer);
+    stream.push({ kind: 'connected' });
+    stream.push({ kind: 'status', sessionID: 'ses_tail', status: 'idle' });
+    await drain(turn.events);
+
+    // Tail events from opencode after the idle — NO new message.updated, so
+    // these are not a real wake-up.
+    stream.push({ kind: 'status', sessionID: 'ses_tail', status: 'running' });
+    stream.push({
+      kind: 'part',
+      sessionID: 'ses_tail',
+      messageID: 'lingering',
+      partID: 'lp',
+      partType: 'step-finish',
+    });
+    stream.push({ kind: 'status', sessionID: 'ses_tail', status: 'idle' });
+
+    // Watcher loops on nextSpontaneousTurn — it should block waiting for a
+    // real wake-up, not surface the trailing housekeeping as a turn.
+    const wakeP = consumer.nextSpontaneousTurn();
+    const raceWinner = await Promise.race([
+      wakeP.then(() => 'wake'),
+      new Promise<'timeout'>((r) => setTimeout(() => r('timeout'), 50)),
+    ]);
+    expect(raceWinner).toBe('timeout');
+
+    // Once a REAL wake-up arrives (message.updated user from
+    // oh-my-openagent's promptAsync), the waiter resolves.
+    stream.push({
+      kind: 'message',
+      sessionID: 'ses_tail',
+      messageID: 'real-wake',
+      role: 'user',
+    });
+    stream.push({
+      kind: 'message',
+      sessionID: 'ses_tail',
+      messageID: 'real-reply',
+      role: 'assistant',
+    });
+    stream.push({
+      kind: 'part',
+      sessionID: 'ses_tail',
+      messageID: 'real-reply',
+      partID: 'rp',
+      partType: 'text',
+      delta: 'real wake-up',
+    });
+    stream.push({ kind: 'status', sessionID: 'ses_tail', status: 'idle' });
+    const wakeTurn = await wakeP;
+    expect(wakeTurn).not.toBeNull();
+    const events = await drain(wakeTurn!.events);
+    const text = events.find((e) => e.type === 'text');
+    expect((text as { type: 'text'; delta: string }).delta).toBe('real wake-up');
+  });
+
   it('the second turn can also abort upstream (sessionAborted dedupe resets per turn)', async () => {
     const stream = new FakeStream();
     const { client, calls } = makeFakeClient('ses_twin');

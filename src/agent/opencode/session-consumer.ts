@@ -333,6 +333,26 @@ export class OpencodeSessionConsumer {
     // translator emits a `system` header at the start of every turn.
     if (n.kind === 'connected') return;
 
+    // Past the just-ended turn. Decide whether to start / continue a
+    // spontaneous turn.
+    //
+    // A real wake-up (oh-my-openagent's `notifyParentSession` calling
+    // `session.promptAsync`) always begins with a `message.updated` event
+    // (the synthetic user message it injects). opencode also emits trailing
+    // housekeeping events after a `status: idle` for a tool-call-finished
+    // turn — late `part.updated` snapshots, an internal `status: running` /
+    // `status: idle` pair before the agent auto-continues, etc. If we promote
+    // those into a "spontaneous turn", the wake-up watcher renders an empty
+    // card stuck on "🧠 正在思考" because the buffer never contains anything
+    // user-visible.
+    //
+    // Filter: only START a spontaneous buffer when the first event is a
+    // `message.updated`. Once buffering, accept everything (the rest of the
+    // turn's stream is parts + statuses).
+    const startsNewTurn = n.kind === 'message';
+    const hasOngoingBuffer = this.pendingSpontaneousEvents.length > 0;
+    if (!startsNewTurn && !hasOngoingBuffer) return;
+
     if (this.nextTurnWaiters.length > 0) {
       const turn = this.startSpontaneousTurn();
       turn.feed(n);

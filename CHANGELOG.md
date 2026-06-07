@@ -7,6 +7,11 @@ This is a private fork of [zarazhangrui/lark-coding-agent-bridge](https://github
 
 Upstream history is not duplicated here; consult [the upstream repo](https://github.com/zarazhangrui/lark-coding-agent-bridge/commits/main) for changes inherited at fork time.
 
+## [0.3.1] - 2026-06-07
+
+### Fixed
+- **Bogus empty wake-up card after a tool-call turn**. opencode emits trailing housekeeping events (a late `part.updated` snapshot, an internal `status: running` → `status: idle` pair before auto-continuing) after the `status: idle` that ends a tool-call-finished turn. The wake-up watcher was promoting those events into a "spontaneous turn" and rendering an empty card stuck on `🧠 正在思考` because the buffer never contained any user-visible content. The consumer now only starts a spontaneous buffer when the first post-idle event is a `message.updated` — the actual signal that a new turn began. Once buffering, the rest of the turn's stream (parts + statuses) is accepted normally.
+
 ## [0.3.0] - 2026-06-07
 
 ### Added
