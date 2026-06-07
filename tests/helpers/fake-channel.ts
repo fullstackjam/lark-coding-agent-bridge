@@ -38,6 +38,9 @@ export interface FakeChannel {
           reply(params: unknown): Promise<unknown>;
           delete(params: unknown): Promise<unknown>;
         };
+        readonly chat: {
+          create(params: unknown): Promise<unknown>;
+        };
       };
     };
   };
@@ -52,6 +55,7 @@ export function createFakeChannel(): FakeChannel {
   const cardById = new Map<string, unknown>();
   let nextCard = 1;
   let nextMessage = 1;
+  let nextChat = 1;
 
   const pushManagedCardMessage = (params: unknown, fallbackChatId: string): { message_id: string } => {
     requests.push({ method: 'im.v1.message.create', params });
@@ -101,6 +105,12 @@ export function createFakeChannel(): FakeChannel {
             async delete(params: unknown): Promise<unknown> {
               requests.push({ method: 'im.v1.message.delete', params });
               return {};
+            },
+          },
+          chat: {
+            async create(params: unknown): Promise<unknown> {
+              requests.push({ method: 'im.v1.chat.create', params });
+              return { data: { chat_id: `oc_fake_chat_${nextChat++}` } };
             },
           },
         },

@@ -311,6 +311,21 @@ describe('Bridge command contracts', () => {
     const root = await loadRootConfig(h.controls.configPath);
     expect(root?.profiles.claude?.access.allowedChats).toEqual(['oc-group-1', 'oc-group-2']);
   });
+
+  it('marks /new chat groups as workbench groups owned by the creator', async () => {
+    const h = await createHarness();
+
+    await expect(h.run('/new chat workbench', { senderId: 'ou-admin' })).resolves.toBe(true);
+
+    const root = await loadRootConfig(h.controls.configPath);
+    const profile = root?.profiles.claude as (ProfileConfig & {
+      workbenchGroups?: Record<string, string>;
+    }) | undefined;
+    expect(profile?.workbenchGroups).toEqual({
+      oc_fake_chat_1: 'ou-admin',
+    });
+    expect(h.workspaces.cwdFor('oc_fake_chat_1')).toBe(h.controls.profileConfig.workspaces.default);
+  });
 });
 
 async function createHarness(): Promise<Harness> {

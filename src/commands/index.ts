@@ -355,6 +355,7 @@ async function handleNewChat(rawName: string, ctx: CommandContext): Promise<void
   if (sourceCwd) {
     ctx.workspaces.setCwd(created.chatId, sourceCwd);
   }
+  await saveWorkbenchGroupOwner(ctx, created.chatId, ctx.msg.senderId);
 
   // Welcome the user inside the new group with a hint about how to start.
   const welcome = sourceCwd
@@ -370,6 +371,45 @@ async function handleNewChat(rawName: string, ctx: CommandContext): Promise<void
     ctx,
     `✓ 已创建群 **${created.name}**，去新群里继续。`,
   );
+}
+
+async function saveWorkbenchGroupOwner(
+  ctx: CommandContext,
+  chatId: string,
+  ownerOpenId: string,
+): Promise<void> {
+  await withConfigFileLock(ctx.controls.configPath, async () => {
+    const root = await loadRootConfig(ctx.controls.configPath);
+    if (!root) {
+      const workbenchGroups = {
+        ...ctx.controls.profileConfig.workbenchGroups,
+        [chatId]: ownerOpenId,
+      };
+      ctx.controls.profileConfig = {
+        ...ctx.controls.profileConfig,
+        workbenchGroups,
+      };
+      ctx.controls.cfg = {
+        ...ctx.controls.cfg,
+        workbenchGroups,
+      } as AppConfig & ProfileConfig;
+      await saveConfig(ctx.controls.cfg, ctx.controls.configPath);
+      return;
+    }
+
+    const profile = root.profiles[ctx.controls.profile];
+    if (!profile) throw new Error(`profile not found: ${ctx.controls.profile}`);
+    root.profiles[ctx.controls.profile] = {
+      ...profile,
+      workbenchGroups: {
+        ...profile.workbenchGroups,
+        [chatId]: ownerOpenId,
+      },
+    };
+    await saveRootConfig(root, ctx.controls.configPath);
+    ctx.controls.profileConfig = root.profiles[ctx.controls.profile]!;
+    ctx.controls.cfg = runtimeProfileConfig(root, ctx.controls.profile);
+  });
 }
 
 async function handleCd(args: string, ctx: CommandContext): Promise<void> {
