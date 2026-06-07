@@ -16,6 +16,7 @@ export interface AccessDecision {
     | 'owner'
     | 'allowed-user'
     | 'allowed-admin'
+    | 'workbench-owner'
     | 'allowed-chat'
     | 'comment-mention'
     | 'denied-user'
@@ -47,6 +48,7 @@ export function canUseGroup(
 ): AccessDecision {
   if (isCreator(controls, senderId)) return allow('owner');
   if (profile.access.admins.includes(senderId)) return allow('allowed-admin');
+  if (profile.workbenchGroups[chatId] === senderId) return allow('workbench-owner');
   if (profile.access.allowedChats.includes(chatId)) return allow('allowed-chat');
   return deny('denied-chat');
 }

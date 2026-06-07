@@ -569,6 +569,10 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     resources: msg.resources.length,
   });
 
+  const workbenchOwner = msg.chatType === 'p2p'
+    ? undefined
+    : controls.profileConfig.workbenchGroups[msg.chatId];
+
   const accessDecision =
     msg.chatType === 'p2p'
       ? canUseDm(controls.profileConfig, controls, msg.senderId)
@@ -579,7 +583,12 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
       sender: msg.senderId.slice(-6),
       reason: accessDecision.reason,
     });
-    if (msg.chatType !== 'p2p' && accessDecision.reason === 'denied-chat' && msg.mentionedBot) {
+    if (
+      !workbenchOwner &&
+      msg.chatType !== 'p2p' &&
+      accessDecision.reason === 'denied-chat' &&
+      msg.mentionedBot
+    ) {
       void sendNonAllowedGroupHint(channel, msg.chatId, msg.messageId).catch((err) =>
         log.warn('intake', 'non-allowed-hint-failed', { err: String(err) }),
       );
@@ -587,19 +596,17 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     return;
   }
 
-  // Group-mention policy. p2p is always unrestricted; in groups (regular and
-  // topic) we drop messages that don't @bot when the user has opted into the
-  // quiet-by-default behavior. Slash commands are NOT exempt — the user
-  // chose strict mode so the group stays uniformly quiet unless mentioned.
-  // @全员 is already filtered by SDK (`respondToMentionAll: false`), so any
-  // event reaching here is either targeted or undirected chatter.
-  if (
-    msg.chatType !== 'p2p' &&
-    getRequireMentionInGroup(controls.cfg) &&
-    !msg.mentionedBot
-  ) {
-    log.info('intake', 'skip-no-mention', { scope, chatType: msg.chatType });
-    return;
+  if (msg.chatType !== 'p2p') {
+    if (workbenchOwner) {
+      const workbenchDecision = await shouldTriggerWorkbenchMessage(channel, msg, workbenchOwner);
+      if (!workbenchDecision.ok) {
+        log.info('intake', workbenchDecision.reason, { scope, chatType: msg.chatType });
+        return;
+      }
+    } else if (getRequireMentionInGroup(controls.cfg) && !msg.mentionedBot) {
+      log.info('intake', 'skip-no-mention', { scope, chatType: msg.chatType });
+      return;
+    }
   }
 
   const handled = await tryHandleCommand({
@@ -632,6 +639,56 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
 
   const size = pending.push(scope, msg);
   log.info('intake', 'queued', { scope, queueSize: size, debounceMs: DEBOUNCE_MS });
+}
+
+type WorkbenchTriggerDecision =
+  | { ok: true }
+  | {
+      ok: false;
+      reason:
+        | 'skip-not-workbench-owner'
+        | 'skip-workbench-owner-mention-other'
+        | 'skip-workbench-owner-reply-non-bot';
+    };
+
+async function shouldTriggerWorkbenchMessage(
+  channel: LarkChannel,
+  msg: NormalizedMessage,
+  ownerOpenId: string,
+): Promise<WorkbenchTriggerDecision> {
+  if (msg.senderId !== ownerOpenId) return { ok: false, reason: 'skip-not-workbench-owner' };
+  if (msg.mentionedBot) return { ok: true };
+  if (mentionsNonBotUser(msg)) {
+    return { ok: false, reason: 'skip-workbench-owner-mention-other' };
+  }
+  if (!msg.replyToMessageId) return { ok: true };
+
+  const senderId = await fetchMessageSenderId(channel, msg.replyToMessageId);
+  if (senderId && senderId === channel.botIdentity?.openId) return { ok: true };
+  return { ok: false, reason: 'skip-workbench-owner-reply-non-bot' };
+}
+
+function mentionsNonBotUser(msg: NormalizedMessage): boolean {
+  return (msg.mentions ?? []).some((mention) => mention.isBot !== true);
+}
+
+async function fetchMessageSenderId(
+  channel: LarkChannel,
+  messageId: string,
+): Promise<string | undefined> {
+  try {
+    const result = (await channel.rawClient.im.v1.message.get({
+      path: { message_id: messageId },
+    })) as { data?: { items?: Array<{ sender?: { id?: unknown } }> } };
+    const senderId = result.data?.items?.[0]?.sender?.id;
+    return typeof senderId === 'string' ? senderId : undefined;
+  } catch (err) {
+    log.warn('intake', 'workbench-reply-sender-fetch-failed', {
+      messageId,
+      err: err instanceof Error ? err.message : String(err),
+    });
+    return undefined;
+  }
 }
 
 interface RunBatchDeps {
