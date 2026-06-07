@@ -18,6 +18,91 @@ For a product walkthrough, see the [Feishu document](https://larkcommunity.feish
 - **Images and files**: send them to the bot directly, and the bridge downloads them locally for the agent.
 - **Interactive cards**: `/help`, `/ws list`, and `/status` return cards with clickable buttons.
 
+## What this fork adds over upstream
+
+Upstream already covers Claude Code and Codex thoroughly. This fork primarily adds the **opencode lane** and a few cross-agent UX improvements built around it:
+
+| Addition | Why it matters | Applies to |
+| --- | --- | --- |
+| **opencode adapter** | Upstream supports Claude / Codex only; this fork adds opencode as the third agent, reusing all upstream features (profiles, workspaces, permission modes, cards). | opencode profile |
+| **Persistent opencode sessions** | Multiple user turns in one chat reuse the same opencode session so the agent remembers context. Without this every message would mint a new session and the agent would forget prior turns. | opencode |
+| **Background-task wake-up card** | When the `oh-my-openagent` plugin's background task finishes, it can **proactively** post a fresh streaming card in Lark to continue the conversation — you don't have to ask again. | opencode + oh-my-openagent |
+| **Interactive permission card** | When opencode emits `permission.asked`, the bridge surfaces it as a card with `Allow once` / `Always allow` / `Reject` buttons, with a 5-minute timeout that auto-rejects. | opencode |
+| **`/new chat <name>` spawns a group** | One command creates a new Lark group with the bot as owner and registers the requester as the workbench owner. **Messages in that group don't need `@bot`** — same idea as [`lark-opencode-bridge`'s](https://github.com/fullstackjam/lark-opencode-bridge) `/spawn`. | all agents |
+| **Better tool-call rendering** | Tool cards read opencode's `state.title`: `✅ read — src/foo.ts` instead of bare `✅ read`. Case-insensitive switch + camelCase fallbacks (`filePath`) + opencode-native names (`todowrite`, `ast_grep_search`). | all agents, opencode benefits most |
+
+### Data flow
+
+```mermaid
+flowchart LR
+    User([Feishu / Lark user])
+    Lark[Feishu WS<br/>persistent connection]
+    Bridge[lark-channel-bridge<br/>local daemon]
+    Agent[Claude / Codex / opencode<br/>local CLI]
+
+    User -- message / image --> Lark
+    Lark -- pushed event --> Bridge
+    Bridge -- prompt / stdin --> Agent
+    Agent -- streaming events --> Bridge
+    Bridge -- streaming card --> Lark
+    Lark -- render card --> User
+```
+
+Code and model execution **stay on your machine**; Lark only carries messages and renders cards.
+
+### Persistent opencode sessions + background-task wake-up
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as User
+    participant B as Bridge
+    participant O as opencode serve
+    participant P as oh-my-openagent
+
+    U->>B: "look up X, take your time"
+    B->>O: createSession + prompt_async
+    O-->>B: SSE: text / tool / status:idle
+    B->>U: card (turn 1 done)
+
+    Note over O,P: background task running<br/>(LSP indexing / long query)
+
+    P->>O: notifyParentSession<br/>(prompt_async injects synthetic user msg)
+    O-->>B: SSE: new message.updated
+    B->>U: new card<br/>🔔 background task complete — agent continues
+```
+
+Notes:
+
+- Each chat runs one long-lived SSE consumer; the opencode session is reused across user turns until `/new` or `/cd` resets it.
+- Wake-up detection works by tracking SSE `messageID`s — trailing re-broadcasts from the just-ended turn are deduped, so the wake-up card only fires for an actually new turn.
+- The wake-up card goes through the same `processAgentStream + channel.stream` pipeline as user-initiated turns, so streaming text, tool cards, permission prompts, and the signed stop button all work identically.
+
+### `/new chat`: spawn a working group
+
+Inspired by [`lark-opencode-bridge`](https://github.com/fullstackjam/lark-opencode-bridge)'s `/spawn`. One group = one session = one project context.
+
+```mermaid
+flowchart TD
+    A["/new chat workbench"] --> B[bridge calls<br/>lark im.chat.create]
+    B --> C[new group: bot is owner<br/>requester invited]
+    C --> D[workbenchGroups<br/>chatId → requester openId]
+    D --> E[requester messages in the group<br/>**no @ needed**]
+    E --> F{shouldTriggerWorkbenchMessage}
+    F -- senderId == owner --> G[run triggers]
+    F -- @ another user --> H[skip]
+    F -- reply to non-bot msg --> H
+```
+
+How it works:
+
+1. `/new chat <name>` creates the Lark group with the bridge as owner and invites the requester.
+2. `cwd` inherits from the originating chat's workspace (anything you set via `/cd` carries over).
+3. `chatId → requester openId` is persisted to `workbenchGroups` in `config.json`.
+4. Any non-`@`, non-cross-replied message from the requester in that group triggers a run; messages that `@` someone else or reply to a non-bot message are skipped.
+
+> ⚠️ **Requires the Lark "receive all group messages" scope**: by default Lark only delivers `@bot`-mention events to the app. For "owner without `@`" to actually fire, **add the `im:message.group_msg:readonly` permission ("Receive group messages") in the Lark Developer Console** and get it approved. This is an advanced scope — without it, the bridge logic is correct but no event ever arrives. Verify by sending a non-`@` message in the workbench group and checking `~/.lark-channel/profiles/<profile>/logs/bridge-$(date +%Y%m%d).jsonl` for a matching `intake.enter` line; if there isn't one, Lark didn't push it.
+
 ## Prerequisites
 
 - Node.js **>= 20.12.0**
@@ -144,6 +229,7 @@ If a profile was created with the wrong agent kind, stop or unregister any match
 | Command | Effect |
 |---|---|
 | `/new`, `/reset` | Clear the current session |
+| `/new chat [name]` | Spawn a new group with the bot as owner and the requester as workbench owner (fork addition; see "What this fork adds → `/new chat`") |
 | `/cd <path>` | Switch working directory and reset the session |
 | `/ws list` | List named workspaces |
 | `/ws save <name>` | Save the current working directory as a named workspace |
@@ -165,7 +251,7 @@ If a profile was created with the wrong agent kind, stop or unregister any match
 | `/doctor [description]` | Run low-sensitive diagnostics |
 | `/help` | Help card |
 
-DMs do not require an @ mention. Groups and topic groups require `@bot` by default; `@all` is ignored. Cloud-doc comments in supported document types run when the bot is mentioned.
+DMs do not require an @ mention. Groups and topic groups require `@bot` by default; `@all` is ignored. Cloud-doc comments in supported document types run when the bot is mentioned. Workbench groups spawned by `/new chat` are an exception: the workbench owner does not need to `@bot` in those groups.
 
 ## lark-cli identity policy
 
@@ -348,5 +434,3 @@ A missing module, a bad factory, or a throwing adapter all degrade to noop — t
 ## License
 
 [MIT](./LICENSE)
-
-<img src="./assets/feedback-group-qr.png" alt="Feedback group QR code" width="360">

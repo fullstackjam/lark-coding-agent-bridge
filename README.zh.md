@@ -18,6 +18,91 @@
 - **图片 / 文件**：直接发给 bot，bridge 下载到本地后交给本机 agent 处理。
 - **卡片按钮**：`/help`、`/ws list`、`/status` 返回可点击的交互卡片。
 
+## Fork 在上游基础上增加的能力
+
+上游已经把 Claude Code / Codex 接得很完整了。本 fork 主要补 **opencode 这条线**，并围绕它加了一些跨 agent 的体验改进：
+
+| 增量 | 价值 | 谁能用 |
+| --- | --- | --- |
+| **opencode adapter** | 上游只支持 Claude / Codex；本 fork 把 opencode 接成第三种 agent，复用全部上游能力（profile / workspace / 权限模式 / 卡片）。 | opencode profile |
+| **持久 opencode 会话** | 同一个聊天的多轮消息复用同一个 opencode session，agent 记得上下文。否则每条消息都是新 session，上下文丢失。 | opencode |
+| **后台任务唤醒卡片** | 装了 `oh-my-openagent` 插件后，它在后台跑完任务能"主动"在飞书弹一张新卡片续聊，不需要你再问一次。 | opencode + oh-my-openagent |
+| **Interactive permission 卡片** | opencode 弹 `permission.asked` 时，bridge 用卡片让你点"允许一次 / 始终允许 / 拒绝"，5 分钟超时自动拒绝。 | opencode |
+| **`/new chat <name>` 自建群** | 一条命令拉一个新群，bot 是群主，发起人登记成 owner，**群里无需 @ bot 即可触发回复**——类似 [`lark-opencode-bridge`](https://github.com/fullstackjam/lark-opencode-bridge) 的 `/spawn` 体验。 | 所有 agent |
+| **工具调用展示** | 工具卡片读取 opencode 的 `state.title`：`✅ read — src/foo.ts` 而不是裸的 `✅ read`；大小写不敏感的工具名 + camelCase fallback。 | 所有 agent，opencode 收益最大 |
+
+### 数据流
+
+```mermaid
+flowchart LR
+    User([飞书 / Lark 用户])
+    Lark[飞书 WS<br/>长连接]
+    Bridge[lark-channel-bridge<br/>本机 daemon]
+    Agent[Claude / Codex / opencode<br/>本机 CLI]
+
+    User -- 消息 / 图片 --> Lark
+    Lark -- 推送事件 --> Bridge
+    Bridge -- prompt / stdin --> Agent
+    Agent -- 流式事件 --> Bridge
+    Bridge -- 流式卡片 --> Lark
+    Lark -- 渲染卡片 --> User
+```
+
+代码和模型执行**始终在你本机**；飞书侧只负责消息传递和卡片渲染。
+
+### opencode 多轮会话 + 后台任务唤醒
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as 用户
+    participant B as Bridge
+    participant O as opencode serve
+    participant P as oh-my-openagent
+
+    U->>B: "查一下 X，慢慢做"
+    B->>O: createSession + prompt_async
+    O-->>B: SSE: text / tool / status:idle
+    B->>U: 卡片 (turn 1 完成)
+
+    Note over O,P: 后台任务跑着<br/>(LSP 索引 / 长查询)
+
+    P->>O: notifyParentSession<br/>(prompt_async 注入合成 user msg)
+    O-->>B: SSE: 新 message.updated
+    B->>U: 新卡片<br/>🔔 后台任务完成后由 agent 主动接续
+```
+
+关键点：
+
+- Bridge 每个聊天维护一个长连 SSE consumer，opencode session 在多轮消息间复用——`/new` 或 `/cd` 才换 session。
+- 后台 wake-up 通过 SSE 事件的 messageID 去识别（trailing re-broadcast 会被 dedupe，避免空卡片）。
+- 卡片走 `processAgentStream + channel.stream`——和用户消息走同一条渲染管道，文字、工具、permission 卡片、停止按钮都和正常 turn 一致。
+
+### `/new chat`：直接拉个工作群
+
+灵感来源是 [`lark-opencode-bridge`](https://github.com/fullstackjam/lark-opencode-bridge) 的 `/spawn`。一个群 = 一个独立 session = 一份项目上下文。
+
+```mermaid
+flowchart TD
+    A["/new chat workbench"] --> B[bridge 调 lark<br/>im.chat.create]
+    B --> C[新群: bot 是群主<br/>邀请发起人]
+    C --> D[workbenchGroups<br/>chatId → 发起人 openId]
+    D --> E[群里发起人发任意消息<br/>**不需要 @ bot**]
+    E --> F{shouldTriggerWorkbenchMessage}
+    F -- senderId == owner --> G[触发 run]
+    F -- @ 了其他人 --> H[跳过]
+    F -- 回复非 bot 消息 --> H
+```
+
+工作机制：
+
+1. `/new chat <name>` 在飞书里建群，bridge 作为群主，把发起人邀请进去。
+2. cwd 继承自原聊天的工作目录（`/cd` 切过的会带过去）。
+3. "chatId → 发起人 openId" 写进 `workbenchGroups` (持久化到 `config.json`)。
+4. 发起人在群里发任何消息（不需要 @）都会触发 run；@ 了别人或回复非 bot 消息会跳过。
+
+> ⚠️ **需要飞书"群消息读取"权限**：默认情况下飞书只把"群里 @ bot"的消息推给应用。要让"owner 无需 @ 即可触发"真的生效，**必须在飞书开放平台后台给应用加 `im:message.group_msg:readonly` 权限**（"获取群组中所有消息"）并通过审批。这是飞书侧的高级权限，没有的话 bridge 这边逻辑写得再对也收不到事件。验证方法：群里发条非 @ 消息，看 `~/.lark-channel/profiles/<profile>/logs/bridge-$(date +%Y%m%d).jsonl` 里有没有对应的 `intake.enter` 条目，没有就是 Lark 没推过来。
+
 ## 前置条件
 
 - Node.js **>= 20.12.0**
@@ -144,6 +229,7 @@ lark-channel-bridge profile export <name> --include-secrets --yes
 | 命令 | 作用 |
 |---|---|
 | `/new`, `/reset` | 清空当前会话 |
+| `/new chat [name]` | 拉个新群、bot 是群主、发起人是 owner（fork 新增；详见 "Fork 增量功能 → `/new chat`"） |
 | `/cd <path>` | 切换工作目录并重置会话 |
 | `/ws list` | 列出命名工作空间 |
 | `/ws save <name>` | 把当前工作目录保存为命名工作空间 |
@@ -165,7 +251,7 @@ lark-channel-bridge profile export <name> --include-secrets --yes
 | `/doctor [描述]` | 执行低敏诊断 |
 | `/help` | 帮助卡片 |
 
-私聊不需要 @。群和话题群默认必须 `@bot`；`@all` 会被忽略。支持的云文档评论里 @bot 就会触发回复。
+私聊不需要 @。群和话题群默认必须 `@bot`；`@all` 会被忽略。支持的云文档评论里 @bot 就会触发回复。`/new chat` 拉起来的 workbench 群是例外：发起人在那个群里发任何消息都不用 @。
 
 ## lark-cli 身份策略
 
@@ -348,5 +434,3 @@ export default createAdapter;
 ## 许可
 
 [MIT](./LICENSE)
-
-<img src="./assets/feedback-group-qr.png" alt="飞书反馈群二维码" width="360">
