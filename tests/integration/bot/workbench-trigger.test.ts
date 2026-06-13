@@ -1,4 +1,4 @@
-import type { NormalizedMessage } from '@larksuiteoapi/node-sdk';
+import type { NormalizedMessage } from '@larksuite/channel';
 import { realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -16,8 +16,8 @@ const sdkMock = vi.hoisted(() => ({
   }),
 }));
 
-vi.mock('@larksuiteoapi/node-sdk', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@larksuiteoapi/node-sdk')>();
+vi.mock('@larksuite/channel', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@larksuite/channel')>();
   return {
     ...actual,
     createLarkChannel: sdkMock.createLarkChannel,
@@ -35,18 +35,8 @@ interface FakeLarkChannel {
   handlers: MessageHandlerMap;
   rawClient: {
     request: ReturnType<typeof vi.fn>;
-    application: {
-      v6: {
-        application: {
-          get: ReturnType<typeof vi.fn>;
-        };
-      };
-    };
     im: {
       v1: {
-        message: {
-          get: ReturnType<typeof vi.fn>;
-        };
         messageReaction: {
           create: ReturnType<typeof vi.fn>;
           delete: ReturnType<typeof vi.fn>;
@@ -54,6 +44,9 @@ interface FakeLarkChannel {
       };
     };
   };
+  getAppInfo: ReturnType<typeof vi.fn>;
+  listChats: ReturnType<typeof vi.fn>;
+  fetchRawMessage: ReturnType<typeof vi.fn>;
   on(handlers: MessageHandlerMap): void;
   connect(): Promise<void>;
   disconnect(): Promise<void>;
@@ -283,39 +276,8 @@ function createFakeLarkChannel(
     botIdentity: { openId: BOT, name: 'Bridge' },
     rawClient: {
       request: vi.fn(async () => ({ data: { items: [] } })),
-      application: {
-        v6: {
-          application: {
-            get: vi.fn(async () => ({
-              data: { app: { owner: { owner_id: 'ou_app_owner' } } },
-            })),
-          },
-        },
-      },
       im: {
         v1: {
-          message: {
-            get: vi.fn(async (params: { path?: { message_id?: string } }) => {
-              const messageId = params.path?.message_id ?? '';
-              const quoted = quotedMessages[messageId] ?? {
-                senderId: OTHER,
-                content: 'quoted content',
-              };
-              return {
-                data: {
-                  items: [
-                    {
-                      message_id: messageId,
-                      msg_type: 'text',
-                      body: { content: JSON.stringify({ text: quoted.content }) },
-                      create_time: '1760000000000',
-                      sender: { id: quoted.senderId },
-                    },
-                  ],
-                },
-              };
-            }),
-          },
           messageReaction: {
             create: vi.fn(async () => ({ data: { reaction_id: 'reaction_1' } })),
             delete: vi.fn(async () => ({})),
@@ -323,6 +285,23 @@ function createFakeLarkChannel(
         },
       },
     },
+    getAppInfo: vi.fn(async () => ({ ownerId: 'ou_app_owner' })),
+    listChats: vi.fn(async () => []),
+    fetchRawMessage: vi.fn(async (messageId: string) => {
+      const quoted = quotedMessages[messageId] ?? {
+        senderId: OTHER,
+        content: 'quoted content',
+      };
+      return [
+        {
+          message_id: messageId,
+          msg_type: 'text',
+          body: { content: JSON.stringify({ text: quoted.content }) },
+          create_time: '1760000000000',
+          sender: { id: quoted.senderId },
+        },
+      ];
+    }),
     on(nextHandlers) {
       Object.assign(handlers, nextHandlers);
     },
