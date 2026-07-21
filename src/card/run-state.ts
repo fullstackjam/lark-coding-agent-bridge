@@ -21,6 +21,7 @@ export type Terminal = 'running' | 'done' | 'interrupted' | 'error' | 'idle_time
 
 export interface RunState {
   blocks: Block[];
+  finalText?: string;
   reasoning: { content: string; active: boolean };
   footer: FooterStatus;
   terminal: Terminal;
@@ -63,6 +64,9 @@ export function reduce(state: RunState, evt: AgentEvent): RunState {
         footer: 'streaming',
       };
     }
+
+    case 'final_text':
+      return { ...state, finalText: evt.content };
 
     case 'thinking': {
       return {

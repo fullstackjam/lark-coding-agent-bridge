@@ -36,6 +36,22 @@ export interface BridgePromptInteractiveCard {
   content: unknown;
 }
 
+/**
+ * A prior message in the same Feishu topic, supplied as read-only context when
+ * the bot is first pulled into a topic it hasn't been part of. Distinct from
+ * `quotedMessages` (an explicit reply-quote): this is the topic's upstream
+ * conversation the bot would otherwise be blind to.
+ */
+export interface BridgePromptTopicMessage {
+  messageId: string;
+  senderId: string;
+  senderName?: string;
+  senderType?: 'user' | 'bot';
+  createdAt?: string;
+  rawContentType: string;
+  content: string;
+}
+
 export interface BridgePromptComment {
   commentScopeId: string;
   isWholeDocument: boolean;
@@ -60,6 +76,7 @@ export interface BuildAgentPromptInput {
   context: BridgePromptContext;
   instructions?: string[];
   userInput: string;
+  topicContext?: BridgePromptTopicMessage[];
   quotedMessages?: BridgePromptQuotedMessage[];
   interactiveCards?: BridgePromptInteractiveCard[];
   comment?: BridgePromptComment;
@@ -71,6 +88,9 @@ export function buildAgentPrompt(input: BuildAgentPromptInput): string {
     promptSection('bridge_context', input.context),
     input.instructions && input.instructions.length > 0
       ? promptSection('bridge_instructions', input.instructions)
+      : undefined,
+    input.topicContext && input.topicContext.length > 0
+      ? promptSection('topic_context', input.topicContext)
       : undefined,
     input.quotedMessages && input.quotedMessages.length > 0
       ? promptSection('quoted_messages', input.quotedMessages)

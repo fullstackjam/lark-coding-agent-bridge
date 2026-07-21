@@ -12,6 +12,7 @@ For a product walkthrough, see the [Feishu document](https://larkcommunity.feish
 
 - Forwards Feishu / Lark messages to local Claude Code, Codex, or opencode CLI. Send a DM directly, or `@bot` in a group.
 - **Streaming card**: text replies and tool calls update on one Lark card in real time.
+- **COT process messages**: optionally send a process message with agent progress text and tool calls, then send the final answer separately.
 - **Session continuity**: each chat, topic, or document comment thread keeps its own session.
 - **Queueing and batching**: messages sent in quick succession are handled together; messages sent during a run are queued for the next turn, while commands like `/new`, `/cd`, `/ws use`, and `/stop` can interrupt the current task.
 - **Multiple workspaces**: use `/cd` to switch the current project, and `/ws` to save and reuse common project directories.
@@ -252,6 +253,17 @@ If a profile was created with the wrong agent kind, stop or unregister any match
 | `/help` | Help card |
 
 DMs do not require an @ mention. Groups and topic groups require `@bot` by default; `@all` is ignored. Cloud-doc comments in supported document types run when the bot is mentioned. Workbench groups spawned by `/new chat` are an exception: the workbench owner does not need to `@bot` in those groups.
+
+## Reply Display and COT
+
+`/config` controls the runtime model and three presentation settings:
+
+- **Model**: Claude and Codex use curated pickers. For opencode, enter a provider-qualified id such as `openai/gpt-5`; leave it empty to follow the opencode configuration.
+- **Message reply mode**: `message card` streams the final reply; `plain text` sends once after the run finishes.
+- **Tool-call display**: controls whether tool blocks appear in the final card / markdown reply.
+- **COT process message**: `off` sends only the final reply; `brief` first sends a COT message with agent progress text and tool summaries; `detailed` also includes tool args and truncated output.
+
+When COT is enabled, the bridge splits the process view and final answer into two messages. The COT message is for tracing what the agent did; the final answer is still generated from the agent's raw text, without heuristic bridge-side filtering. If an agent emits final-answer text as ordinary stream text, that text can also appear in the COT process message.
 
 ## lark-cli identity policy
 

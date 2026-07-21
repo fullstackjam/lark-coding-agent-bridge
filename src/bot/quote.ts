@@ -11,6 +11,9 @@ export interface QuotedContext {
   messageId: string;
   senderId: string;
   senderName?: string;
+  /** Human vs bot, derived from the Feishu `sender.sender_type`. Undefined when
+   * the source item didn't carry it (single-quote fetch path). */
+  senderType?: 'user' | 'bot';
   /** ISO timestamp of the quoted message's creation. Empty when SDK can't
    * resolve it from the fetched item. */
   createdAt: string;
@@ -95,6 +98,28 @@ export async function fetchQuotedContext(
     }
   };
 
+  return normalizeItemToQuoted(channel, parent, fetchSubMessages);
+}
+
+function mapSenderType(raw: unknown): 'user' | 'bot' | undefined {
+  if (raw === 'user') return 'user';
+  if (raw === 'app' || raw === 'bot') return 'bot';
+  return undefined;
+}
+
+/**
+ * Normalize a single fetched message item (from `im.v1.message.get` or
+ * `im.v1.message.list`) into a {@link QuotedContext}. Shared by the reply-quote
+ * path and the topic-context path. `fetchSubMessages` resolves merge_forward
+ * children — callers decide whether to reuse an already-fetched batch or fetch
+ * fresh.
+ */
+async function normalizeItemToQuoted(
+  channel: LarkChannel,
+  parent: ApiMessageItem,
+  fetchSubMessages: (mid: string) => Promise<ApiMessageItem[]>,
+): Promise<QuotedContext | undefined> {
+  if (!parent.message_id) return undefined;
   const senderOpenId = parent.sender?.id;
   const fakeRaw: RawMessageEvent = {
     sender: { sender_id: { open_id: senderOpenId } },
@@ -126,6 +151,7 @@ export async function fetchQuotedContext(
       messageId: parent.message_id,
       senderId: senderOpenId ?? '',
       senderName: normalized.senderName,
+      senderType: mapSenderType(parent.sender?.sender_type),
       createdAt: Number.isFinite(createMs) && createMs > 0
         ? new Date(createMs).toISOString()
         : '',
@@ -136,10 +162,82 @@ export async function fetchQuotedContext(
     };
   } catch (err) {
     log.warn('quote', 'normalize-failed', {
-      messageId,
+      messageId: parent.message_id,
       err: err instanceof Error ? err.message : String(err),
     });
     return undefined;
+  }
+}
+
+/**
+ * Fetch a Feishu topic's upstream messages (chronological) so the agent has the
+ * conversation it's being pulled into. Feishu's `im.v1.message.list` with
+ * `container_id_type=thread` returns every message in the topic — including the
+ * root that may never have @-mentioned the bot. Used only on the bot's first
+ * engagement in a topic (an already-engaged topic keeps its history in the
+ * resumed session).
+ *
+ * `excludeIds` drops the triggering messages and any explicit reply-quotes so
+ * they aren't duplicated. Capped at `maxMessages` (keeps the most recent when
+ * the topic is longer). Returns `[]` on any error — context is best-effort.
+ */
+export async function fetchTopicContext(
+  channel: LarkChannel,
+  threadId: string,
+  opts: { maxMessages: number; excludeIds?: Set<string> },
+): Promise<QuotedContext[]> {
+  const collected: ApiMessageItem[] = [];
+  let pageToken: string | undefined;
+  try {
+    do {
+      const res = await channel.rawClient.im.v1.message.list({
+        params: {
+          container_id_type: 'thread',
+          container_id: threadId,
+          sort_type: 'ByCreateTimeAsc',
+          page_size: 50,
+          ...(pageToken ? { page_token: pageToken } : {}),
+        },
+      });
+      const data = (res as {
+        data?: { items?: ApiMessageItem[]; messages?: ApiMessageItem[]; has_more?: boolean; page_token?: string };
+      }).data;
+      const items = data?.items ?? data?.messages ?? [];
+      collected.push(...items);
+      pageToken = data?.has_more ? data.page_token : undefined;
+    } while (pageToken && collected.length < opts.maxMessages * 4);
+  } catch (err) {
+    log.warn('topic', 'context-fetch-failed', {
+      threadId,
+      err: err instanceof Error ? err.message : String(err),
+    });
+    return [];
+  }
+
+  const exclude = opts.excludeIds ?? new Set<string>();
+  const relevant = collected
+    .filter(
+      (m) => m.message_id && !exclude.has(m.message_id) && !(m as { deleted?: boolean }).deleted,
+    )
+    .slice(-opts.maxMessages);
+
+  const out: QuotedContext[] = [];
+  for (const item of relevant) {
+    const fetchSubMessages = async (mid: string): Promise<ApiMessageItem[]> => {
+      const source = mid === item.message_id ? [item] : await safeFetchRaw(channel, mid);
+      return source.map(preExpandInteractive);
+    };
+    const quoted = await normalizeItemToQuoted(channel, item, fetchSubMessages);
+    if (quoted) out.push(quoted);
+  }
+  return out;
+}
+
+async function safeFetchRaw(channel: LarkChannel, messageId: string): Promise<ApiMessageItem[]> {
+  try {
+    return await channel.fetchRawMessage(messageId, { cardContentType: 'user_card_content' });
+  } catch {
+    return [];
   }
 }
 

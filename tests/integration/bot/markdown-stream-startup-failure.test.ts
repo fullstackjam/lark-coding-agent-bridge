@@ -2,6 +2,7 @@ import type { NormalizedMessage } from '@larksuite/channel';
 import { realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { AgentEvent } from '../../../src/agent/types.js';
 import { createDefaultProfileConfig } from '../../../src/config/profile-schema.js';
 import { log } from '../../../src/core/logger.js';
 import { SessionStore } from '../../../src/session/store.js';
@@ -61,13 +62,14 @@ interface FakeLarkChannel {
   disconnect(): Promise<void>;
   getChatMode(chatId: string): Promise<'group' | 'topic'>;
   getConnectionStatus(): { state: 'connected'; reconnectAttempts: number };
-  send(chatId: string, content: unknown, options?: unknown): Promise<void>;
+  send(chatId: string, content: unknown, options?: unknown): Promise<{ messageId: string }>;
   stream(chatId: string, input: unknown, options?: unknown): Promise<void>;
   addReaction(messageId: string, emojiType: string): Promise<string>;
   removeReaction(messageId: string, reactionId: string): Promise<void>;
 }
 
 type StreamFn = FakeLarkChannel['stream'];
+type SendFn = FakeLarkChannel['send'];
 
 const cleanups: Array<() => Promise<void>> = [];
 
@@ -156,11 +158,146 @@ describe('markdown stream startup failures', () => {
       ),
     );
   }, 10_000);
+
+  it('sends one dedicated non-streaming final reply after progress completes', async () => {
+    const visibleProgress: string[] = [];
+    const h = await createHarness({
+      events: [
+        { type: 'text', delta: 'progress update' },
+        { type: 'final_text', content: 'FINAL_SENTINEL' },
+        { type: 'done', terminationReason: 'normal' },
+      ],
+      stream: async (_chatId, input) => {
+        const producer = (input as {
+          markdown?: (ctrl: { setContent(markdown: string): Promise<void> }) => Promise<void>;
+        }).markdown;
+        await producer?.({
+          setContent: vi.fn(async (markdown: string) => {
+            visibleProgress.push(markdown);
+          }),
+        });
+      },
+    });
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(message('om_final', 'run'));
+    await waitFor(() => h.channel.sent.length === 1);
+
+    expect(visibleProgress.some((markdown) => markdown.includes('progress update'))).toBe(true);
+    expect(h.channel.sent).toHaveLength(1);
+    expect(lastMarkdown(h.channel)).toContain('FINAL_SENTINEL');
+    expect(h.channel.sent[0]?.options).toMatchObject({ replyTo: 'om_final' });
+  });
+
+  it('still sends the final reply when the progress stream fails at completion', async () => {
+    const fail = vi.spyOn(log, 'fail').mockImplementation(() => {});
+    const h = await createHarness({
+      events: [
+        { type: 'text', delta: 'progress update' },
+        { type: 'final_text', content: 'FINAL_AFTER_STREAM_FAILURE' },
+        { type: 'done', terminationReason: 'normal' },
+      ],
+      stream: async (_chatId, input) => {
+        const producer = (input as {
+          markdown?: (ctrl: { setContent(markdown: string): Promise<void> }) => Promise<void>;
+        }).markdown;
+        await producer?.({ setContent: vi.fn(async () => {}) });
+        throw new Error('progress stream failed');
+      },
+    });
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(message('om_stream_fail', 'run'));
+    await waitFor(() => h.channel.sent.length === 1);
+
+    expect(lastMarkdown(h.channel)).toContain('FINAL_AFTER_STREAM_FAILURE');
+    expect(
+      fail.mock.calls.some(
+        (call) =>
+          call[0] === 'stream' &&
+          call[1] instanceof Error &&
+          call[1].message === 'progress stream failed' &&
+          (call[2] as { step?: string } | undefined)?.step === 'progress-stream',
+      ),
+    ).toBe(true);
+  });
+
+  it('does not record delivery when the final send has no message receipt', async () => {
+    const fail = vi.spyOn(log, 'fail').mockImplementation(() => {});
+    const info = vi.spyOn(log, 'info').mockImplementation(() => {});
+    const h = await createHarness({
+      events: [
+        { type: 'final_text', content: 'FINAL_WITHOUT_RECEIPT' },
+        { type: 'done', terminationReason: 'normal' },
+      ],
+      send: async () => ({ messageId: '' }),
+      stream: async (_chatId, input) => {
+        const producer = (input as {
+          markdown?: (ctrl: { setContent(markdown: string): Promise<void> }) => Promise<void>;
+        }).markdown;
+        await producer?.({ setContent: vi.fn(async () => {}) });
+      },
+    });
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(message('om_no_receipt', 'run'));
+    await waitFor(() =>
+      fail.mock.calls.some(
+        (call) => call[1] instanceof Error && call[1].message.includes('missing message receipt'),
+      ),
+    );
+
+    expect(
+      info.mock.calls.some((call) => call[0] === 'outbound' && call[1] === 'sent'),
+    ).toBe(false);
+  });
+
+  it('sends one dedicated final reply card after progress completes in card mode', async () => {
+    const progressCards: unknown[] = [];
+    const h = await createHarness({
+      messageReply: 'card',
+      events: [
+        { type: 'text', delta: 'progress update' },
+        { type: 'final_text', content: 'FINAL_SENTINEL' },
+        { type: 'done', terminationReason: 'normal' },
+      ],
+      stream: async (_chatId, input) => {
+        const producer = (input as {
+          card?: { producer?: (ctrl: { update(next: unknown): Promise<void> }) => Promise<void> };
+        }).card?.producer;
+        await producer?.({
+          update: vi.fn(async (next: unknown) => {
+            progressCards.push(next);
+          }),
+        });
+      },
+    });
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(message('om_card_final', 'run'));
+    await waitFor(() => h.channel.sent.length === 1);
+
+    // Intermediate agent messages stream as progress; the final answer never
+    // leaks into the progress card (it is held back for the dedicated reply).
+    const progressJson = JSON.stringify(progressCards);
+    expect(progressJson).toContain('progress update');
+    expect(progressJson).not.toContain('FINAL_SENTINEL');
+
+    // The terminal answer arrives as exactly one non-streaming card send.
+    expect(h.channel.sent).toHaveLength(1);
+    const finalJson = JSON.stringify(h.channel.sent[0]?.content);
+    expect(finalJson).toContain('FINAL_SENTINEL');
+    expect(finalJson).not.toContain('progress update');
+    expect(h.channel.sent[0]?.options).toMatchObject({ replyTo: 'om_card_final' });
+  });
 });
 
 async function createHarness(options: {
   reactionCreate?: () => Promise<{ data: { reaction_id: string } }>;
   stream?: StreamFn;
+  send?: SendFn;
+  events?: readonly AgentEvent[];
+  messageReply?: 'card' | 'markdown' | 'text';
 } = {}): Promise<{
   tmp: TmpProfile;
   channel: FakeLarkChannel;
@@ -187,6 +324,7 @@ async function createHarness(options: {
     codex: {
       binaryPath: '/usr/local/bin/codex',
     },
+    ...(options.messageReply ? { preferences: { messageReply: options.messageReply } } : {}),
   });
   const profileConfig = {
     ...baseProfileConfig,
@@ -200,16 +338,18 @@ async function createHarness(options: {
   const agent = new FakeAgentAdapter({
     id: 'codex',
     displayName: 'Codex',
-    events: [
-      [
-        {
-          type: 'error',
-          message: 'codex exited with code 1: Error loading config.toml',
-          terminationReason: 'failed',
-        },
-      ],
-      [{ type: 'done', terminationReason: 'normal' }],
-    ],
+    events: options.events
+      ? [options.events]
+      : [
+          [
+            {
+              type: 'error',
+              message: 'codex exited with code 1: Error loading config.toml',
+              terminationReason: 'failed',
+            },
+          ],
+          [{ type: 'done', terminationReason: 'normal' }],
+        ],
   });
   const channel = createFakeLarkChannel(options);
   sdkMock.channel = channel;
@@ -246,9 +386,10 @@ async function startTestBridge(h: {
   cleanups.push(() => bridge.disconnect());
 }
 
-function createFakeLarkChannel(options: {
+function createFakeLarkChannel(harnessOptions: {
   reactionCreate?: () => Promise<{ data: { reaction_id: string } }>;
   stream?: StreamFn;
+  send?: SendFn;
 } = {}): FakeLarkChannel {
   const handlers: MessageHandlerMap = {};
   const sent: FakeLarkChannel['sent'] = [];
@@ -273,7 +414,7 @@ function createFakeLarkChannel(options: {
             get: vi.fn(async () => ({ data: { items: [] } })),
           },
           messageReaction: {
-            create: vi.fn(options.reactionCreate ?? (async () => ({ data: { reaction_id: 'reaction_1' } }))),
+            create: vi.fn(harnessOptions.reactionCreate ?? (async () => ({ data: { reaction_id: 'reaction_1' } }))),
             delete: vi.fn(async () => ({})),
           },
         },
@@ -292,8 +433,10 @@ function createFakeLarkChannel(options: {
     },
     async send(chatId, content, options) {
       sent.push({ chatId, content, options });
+      if (harnessOptions.send) return harnessOptions.send(chatId, content, options);
+      return { messageId: `sent_${sent.length}` };
     },
-    stream: options.stream ?? (async () => {
+    stream: harnessOptions.stream ?? (async () => {
       await new Promise<void>(() => {});
     }),
     async addReaction(messageId, emojiType) {
