@@ -4,6 +4,10 @@
   "description": "Fork of zarazhangrui/lark-coding-agent-bridge with opencode adapter added",
   "type": "module",
   "packageManager": "pnpm@10.33.0",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/fullstackjam/lark-coding-agent-bridge.git"
@@ -43,7 +47,7 @@
   },
   "dependencies": {
     "@clack/prompts": "^1.4.0",
-    "@larksuite/channel": "^0.2.0",
+    "@larksuite/channel": "^0.4.0",
     "commander": "^12.1.0",
     "cross-spawn": "^7.0.6",
     "graceful-fs": "^4.2.11",

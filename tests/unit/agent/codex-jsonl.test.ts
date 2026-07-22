@@ -44,9 +44,7 @@ describe('Codex JSONL translator', () => {
         isError: false,
       },
     ]);
-    expect(t.translate({ type: 'agent_message', message: 'hello' })).toEqual([
-      { type: 'text', delta: 'hello' },
-    ]);
+    expect(t.translate({ type: 'agent_message', message: 'hello' })).toEqual([]);
     expect(
       t.translate({
         type: 'turn.completed',
@@ -58,6 +56,7 @@ describe('Codex JSONL translator', () => {
         },
       }),
     ).toEqual([
+      { type: 'final_text', content: 'hello' },
       {
         type: 'usage',
         inputTokens: 12,
@@ -90,7 +89,39 @@ describe('Codex JSONL translator', () => {
           text: 'hello from item',
         },
       }),
-    ).toEqual([{ type: 'text', delta: 'hello from item' }]);
+    ).toEqual([]);
+    expect(t.translate({ type: 'turn.completed' })).toEqual([
+      { type: 'final_text', content: 'hello from item' },
+      { type: 'done', terminationReason: 'normal' },
+    ]);
+  });
+
+  it('streams earlier agent messages but reserves the last one as the final answer', () => {
+    const t = new CodexJsonlTranslator();
+
+    expect(t.translate({ type: 'agent_message', message: 'progress one' })).toEqual([]);
+    expect(t.translate({ type: 'agent_message', message: 'progress two' })).toEqual([
+      { type: 'text', delta: 'progress one' },
+    ]);
+    expect(
+      t.translate({
+        type: 'item.started',
+        item: { id: 'cmd-after-progress', type: 'command_execution', command: 'pwd' },
+      }),
+    ).toEqual([
+      { type: 'text', delta: 'progress two' },
+      {
+        type: 'tool_use',
+        id: 'cmd-after-progress',
+        name: 'command_execution',
+        input: { command: 'pwd' },
+      },
+    ]);
+    expect(t.translate({ type: 'agent_message', message: 'final answer' })).toEqual([]);
+    expect(t.translate({ type: 'turn.completed' })).toEqual([
+      { type: 'final_text', content: 'final answer' },
+      { type: 'done', terminationReason: 'normal' },
+    ]);
   });
 
   it('treats missing command exit codes as successful command results', () => {
@@ -147,10 +178,9 @@ describe('Codex JSONL translator', () => {
       }),
     ).toEqual([]);
     expect(t.terminalEmitted()).toBe(false);
-    expect(t.translate({ type: 'agent_message', message: 'after retry' })).toEqual([
-      { type: 'text', delta: 'after retry' },
-    ]);
+    expect(t.translate({ type: 'agent_message', message: 'after retry' })).toEqual([]);
     expect(t.translate({ type: 'turn.completed' })).toEqual([
+      { type: 'final_text', content: 'after retry' },
       { type: 'done', threadId: 'thread-retry', terminationReason: 'normal' },
     ]);
   });

@@ -100,6 +100,7 @@ export class CodexAdapter implements AgentAdapter {
       images: opts.images,
       ignoreUserConfig: this.ignoreUserConfig,
       ignoreRules: this.ignoreRules,
+      model: opts.model,
     });
     const envOverrides: NodeJS.ProcessEnv = buildLarkChannelEnv(this.larkChannel);
     if (this.codexHome) {
@@ -119,6 +120,7 @@ export class CodexAdapter implements AgentAdapter {
       hasThread: Boolean(opts.threadId),
       promptChars: opts.prompt.length,
       images: opts.images?.length ?? 0,
+      model: opts.model,
     });
 
     const stderrChunks: Buffer[] = [];
@@ -248,7 +250,7 @@ async function* createEventStream(
 
   const earlyRuntimeError = getError();
   if (earlyRuntimeError && child.exitCode === null && child.signalCode === null) {
-    yield terminalError(`codex runtime error: ${earlyRuntimeError.message}`);
+    yield* translator.fail(`codex runtime error: ${earlyRuntimeError.message}`);
     return;
   }
 
@@ -264,24 +266,16 @@ async function* createEventStream(
     if (!translator.terminalEmitted()) {
       const stderr = Buffer.concat(stderrChunks).toString('utf8').trim();
       const detail = stderr ? `: ${stderr.slice(0, 500)}` : '';
-      yield terminalError(`codex exited with code ${exitCode}${detail}`);
+      yield* translator.fail(`codex exited with code ${exitCode}${detail}`);
     }
     return;
   }
   if (runtimeError && !translator.terminalEmitted()) {
-    yield terminalError(`codex runtime error: ${runtimeError.message}`);
+    yield* translator.fail(`codex runtime error: ${runtimeError.message}`);
     return;
   }
 
   yield* translator.finish();
-}
-
-function terminalError(message: string): AgentEvent {
-  return {
-    type: 'error',
-    message,
-    terminationReason: 'failed',
-  };
 }
 
 async function waitForExitCode(child: CodexChild): Promise<number | null> {

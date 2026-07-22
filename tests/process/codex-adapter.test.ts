@@ -61,7 +61,7 @@ describe('CodexAdapter process contract', () => {
     expect(run.runId).toBe('run-fresh');
     expect(await collect(run.events)).toEqual([
       { type: 'system', threadId: 'thread-fresh' },
-      { type: 'text', delta: 'hello user' },
+      { type: 'final_text', content: 'hello user' },
       { type: 'done', threadId: 'thread-fresh', terminationReason: 'normal' },
     ]);
     const record = await readRecord(fake.recordPath);
@@ -340,7 +340,7 @@ describe('CodexAdapter process contract', () => {
 
     expect(await collect(run.events)).toEqual([
       { type: 'system', threadId: 'thread-retry' },
-      { type: 'text', delta: 'after retry' },
+      { type: 'final_text', content: 'after retry' },
       { type: 'done', threadId: 'thread-retry', terminationReason: 'normal' },
     ]);
   });
