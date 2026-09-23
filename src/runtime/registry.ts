@@ -43,7 +43,7 @@ export interface ProcessEntry {
   configPath: string;
   startedAt: string;
   version: string;
-  /** Bot's display name (e.g. "尼莫"). Filled in by startChannel after the
+  /** Bot's display name. Filled in by startChannel after the
    * WS handshake — undefined until the connection is up, or on processes
    * registered by older versions of the bridge. */
   botName?: string;

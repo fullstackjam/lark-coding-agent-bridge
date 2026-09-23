@@ -22,6 +22,13 @@ export interface ProfileAccess {
   allowedChats: string[];
   admins: string[];
   requireMentionInGroup: boolean;
+  /**
+   * Per-chat override of {@link requireMentionInGroup}, keyed by chat_id.
+   * `true` = require an @-mention in that chat, `false` = respond to every
+   * message. A chat absent from the map follows the global setting. Takes
+   * priority over `requireMentionInGroup` for the chats it lists.
+   */
+  chatRequireMention?: Record<string, boolean>;
 }
 
 export interface SandboxConfig {
@@ -54,6 +61,53 @@ export interface AttachmentConfig {
 }
 
 export type CommentConfig = Record<string, never>;
+
+/** Where the agent's answer goes when it responds to meeting content. */
+export type MeetingRespondIn = 'meeting' | 'im' | 'both';
+
+/**
+ * Where the end-of-meeting summary is delivered.
+ *  - `origin`: the chat the bot was told to join from (`/meeting join` there).
+ *  - `owner`: the bot owner's direct message.
+ * Either way the other one is used as a fallback, so a summary is never
+ * silently dropped just because the preferred target isn't available (a
+ * console-initiated join has no origin chat; an unresolved owner has no DM).
+ */
+export type MeetingSummaryTarget = 'origin' | 'owner';
+
+/**
+ * In-meeting agent ("智能体入会", path 2 / TAT): the bot joins a Feishu meeting
+ * as a real participant, receives in-meeting activity (transcript, chat,
+ * participants, doc shares) and can answer in the meeting or over IM.
+ *
+ * Off by default — the capability is gated by a Feishu allowlist plus the
+ * `vc:meeting.bot.join:write` scope, so it must be opted into per profile.
+ */
+export interface MeetingConfig {
+  enabled: boolean;
+  /** Auto-join when the bot is invited (needs `vc.bot.meeting_invited_v1` push). */
+  autoJoinOnInvite: boolean;
+  transcript: {
+    /** Rolling transcript lines kept as agent context. */
+    keep: number;
+    /** Debounce window (ms) before a sentence counts as final; 0 = emit every update. */
+    stabilizeMs: number;
+  };
+  /** Where answers go. */
+  respondIn: MeetingRespondIn;
+  /**
+   * Extra prefix that makes an in-meeting chat message a question for the agent.
+   * `@<bot 当前名字>` is always accepted on top of this, so the natural thing to
+   * type works without configuring anything.
+   */
+  trigger: string;
+  /** Base interval for the `bots/events` poller (idle rounds back off). */
+  pollIntervalMs: number;
+  /** Summarize the meeting to IM when it ends. */
+  summaryOnEnd: boolean;
+  /** Preferred destination for that summary. See {@link MeetingSummaryTarget}. */
+  summaryTarget: MeetingSummaryTarget;
+}
 
 export type LarkCliIdentityPreset = 'bot-only' | 'user-default';
 
@@ -109,6 +163,8 @@ export interface ProfileConfig {
   codex?: CodexConfig;
   attachments: AttachmentConfig;
   comments: CommentConfig;
+  /** In-meeting agent settings. See {@link MeetingConfig}. */
+  meeting: MeetingConfig;
   larkCli: LarkCliConfig;
 }
 
@@ -187,6 +243,7 @@ export function normalizeProfileConfig(input: unknown): ProfileConfig {
     codex?: CodexConfig & { flags?: unknown };
     attachments?: Partial<AttachmentConfig>;
     comments?: unknown;
+    meeting?: unknown;
     larkCli?: unknown;
   };
 
@@ -218,6 +275,7 @@ export function normalizeProfileConfig(input: unknown): ProfileConfig {
   const sandbox = permissionsToLegacySandbox(permissions);
   const workspaces = normalizeWorkspaces(raw.workspaces);
   const comments = normalizeComments(raw.comments);
+  const meeting = normalizeMeeting(raw.meeting);
   const larkCli = normalizeLarkCli(raw.larkCli);
 
   return {
@@ -243,6 +301,7 @@ export function normalizeProfileConfig(input: unknown): ProfileConfig {
       cacheMaxBytes: numberOr(raw.attachments?.cacheMaxBytes, 512 * 1024 * 1024),
     },
     comments,
+    meeting,
     larkCli,
   };
 }
@@ -303,12 +362,25 @@ function normalizeAccess(
   access: Partial<ProfileAccess> | undefined,
   legacyRequireMentionInGroup: boolean | undefined,
 ): ProfileAccess {
+  const chatRequireMention = normalizeChatMentionMap(access?.chatRequireMention);
   return {
     allowedUsers: stringArray(access?.allowedUsers),
     allowedChats: stringArray(access?.allowedChats),
     admins: stringArray(access?.admins),
     requireMentionInGroup: access?.requireMentionInGroup ?? legacyRequireMentionInGroup ?? true,
+    // Omit when empty so configs without per-chat overrides stay clean.
+    ...(Object.keys(chatRequireMention).length > 0 ? { chatRequireMention } : {}),
   };
+}
+
+/** Keep only string→boolean entries; drop anything malformed. */
+function normalizeChatMentionMap(input: unknown): Record<string, boolean> {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return {};
+  const out: Record<string, boolean> = {};
+  for (const [chatId, value] of Object.entries(input as Record<string, unknown>)) {
+    if (chatId && typeof value === 'boolean') out[chatId] = value;
+  }
+  return out;
 }
 
 function normalizeWorkspaces(input: {
@@ -341,6 +413,59 @@ function normalizeCodex(input: CodexConfig & { flags?: unknown }): CodexConfig {
 
 function normalizeComments(_input: unknown): CommentConfig {
   return {};
+}
+
+/** Defaults keep the in-meeting agent off until a profile opts in. */
+export const MEETING_DEFAULTS: MeetingConfig = {
+  enabled: false,
+  autoJoinOnInvite: false,
+  transcript: { keep: 200, stabilizeMs: 0 },
+  respondIn: 'meeting',
+  trigger: '@bot',
+  pollIntervalMs: 3000,
+  summaryOnEnd: false,
+  summaryTarget: 'origin',
+};
+
+function normalizeMeeting(input: unknown): MeetingConfig {
+  const raw = (input && typeof input === 'object' ? input : {}) as {
+    enabled?: unknown;
+    autoJoinOnInvite?: unknown;
+    transcript?: { keep?: unknown; stabilizeMs?: unknown };
+    respondIn?: unknown;
+    trigger?: unknown;
+    pollIntervalMs?: unknown;
+    summaryOnEnd?: unknown;
+    summaryTarget?: unknown;
+  };
+  const trigger = typeof raw.trigger === 'string' && raw.trigger.trim() ? raw.trigger.trim() : MEETING_DEFAULTS.trigger;
+  return {
+    enabled: raw.enabled === true,
+    autoJoinOnInvite: raw.autoJoinOnInvite === true,
+    transcript: {
+      keep: clampNumber(raw.transcript?.keep, 10, 2000, MEETING_DEFAULTS.transcript.keep),
+      // 0 is meaningful here ("no debounce"), so it can't go through numberOr.
+      stabilizeMs: clampNumber(raw.transcript?.stabilizeMs, 0, 30_000, MEETING_DEFAULTS.transcript.stabilizeMs),
+    },
+    respondIn:
+      raw.respondIn === 'im' || raw.respondIn === 'both' || raw.respondIn === 'meeting'
+        ? raw.respondIn
+        : MEETING_DEFAULTS.respondIn,
+    trigger,
+    pollIntervalMs: clampNumber(raw.pollIntervalMs, 1000, 60_000, MEETING_DEFAULTS.pollIntervalMs),
+    summaryOnEnd: raw.summaryOnEnd === true,
+    summaryTarget:
+      raw.summaryTarget === 'owner' || raw.summaryTarget === 'origin'
+        ? raw.summaryTarget
+        : MEETING_DEFAULTS.summaryTarget,
+  };
+}
+
+/** Like {@link numberOr} but keeps 0 and bounds the result. */
+function clampNumber(value: unknown, min: number, max: number, fallback: number): number {
+  const n = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, Math.floor(n)));
 }
 
 function normalizeLarkCli(input: unknown): LarkCliConfig {

@@ -3,6 +3,7 @@ import { realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { AgentEvent } from '../../../src/agent/types.js';
+import type { FakeAgentEvents } from '../../helpers/fake-agent.js';
 import { createDefaultProfileConfig } from '../../../src/config/profile-schema.js';
 import { log } from '../../../src/core/logger.js';
 import { SessionStore } from '../../../src/session/store.js';
@@ -123,6 +124,19 @@ describe('markdown stream startup failures', () => {
     const streamFailure = deferred<void>();
     let streamProducerStarted = false;
     const h = await createHarness({
+      // The first run has to stream something, or no progress stream is opened
+      // at all and there is no late failure to log.
+      events: [
+        [
+          { type: 'text', delta: 'progress update' },
+          {
+            type: 'error',
+            message: 'codex exited with code 1: Error loading config.toml',
+            terminationReason: 'failed',
+          },
+        ],
+        [{ type: 'done', terminationReason: 'normal' }],
+      ],
       stream: async (_chatId, input) => {
         const producer = (input as {
           markdown?: (ctrl: { setContent(markdown: string): Promise<void> }) => Promise<void>;
@@ -188,6 +202,129 @@ describe('markdown stream startup failures', () => {
     expect(lastMarkdown(h.channel)).toContain('FINAL_SENTINEL');
     expect(h.channel.sent[0]?.options).toMatchObject({ replyTo: 'om_final' });
   });
+
+  it('opens no progress stream for a final-only round', async () => {
+    // The regression this guards: Codex answering without any commentary. The
+    // SDK sends its streaming card as soon as `stream()` is called and finishes
+    // an empty one with "(no content)", so the user saw that placeholder for a
+    // few seconds, watched it get recalled, and only then got the answer.
+    const streamCalls: unknown[] = [];
+    const h = await createHarness({
+      events: [
+        { type: 'final_text', content: 'FINAL_ONLY_SENTINEL' },
+        { type: 'done', terminationReason: 'normal' },
+      ],
+      stream: async (_chatId, input) => {
+        streamCalls.push(input);
+      },
+    });
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(message('om_final_only', 'run'));
+    await waitFor(() => h.channel.sent.length === 1);
+    // give a stray stream / recall a chance to fire before asserting
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    expect(streamCalls).toHaveLength(0);
+    expect(h.channel.sent).toHaveLength(1);
+    expect(lastMarkdown(h.channel)).toContain('FINAL_ONLY_SENTINEL');
+  });
+
+  it('does not repeat streamed text as the final reply when Codex held nothing back', async () => {
+    // Codex only reserves its *last* message as `final_text`; an abnormal turn
+    // end (turn.failed, or the process dying before turn.completed) flushes it
+    // as a text block instead. Those blocks are already on screen, so the
+    // dedicated final reply must not post the same words a second time.
+    const visibleProgress: string[] = [];
+    const h = await createHarness({
+      events: [
+        { type: 'text', delta: '这是答案' },
+        { type: 'done', terminationReason: 'normal' },
+      ],
+      stream: async (_chatId, input) => {
+        const producer = (input as {
+          markdown?: (ctrl: { setContent(markdown: string): Promise<void> }) => Promise<void>;
+        }).markdown;
+        await producer?.({
+          setContent: vi.fn(async (markdown: string) => {
+            visibleProgress.push(markdown);
+          }),
+        });
+      },
+    });
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(message('om_no_final', 'run'));
+    await waitFor(() => visibleProgress.some((markdown) => markdown.includes('这是答案')));
+    // give a (duplicate) final reply a chance to fire before asserting
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    expect(h.channel.sent).toHaveLength(0);
+  });
+
+  it('waits for a slow-opening progress stream instead of replying alongside it', async () => {
+    // Opening a streaming card costs two API round trips. When the run finishes
+    // first, replying right away duplicates the answer verbatim — once as text,
+    // once as the card that lands a moment later.
+    const visibleProgress: string[] = [];
+    const h = await createHarness({
+      agentKind: 'claude',
+      events: [
+        { type: 'text', delta: 'ANSWER_ONCE' },
+        { type: 'done', terminationReason: 'normal' },
+      ],
+      stream: async (_chatId, input) => {
+        const producer = (input as {
+          markdown?: (ctrl: { setContent(markdown: string): Promise<void> }) => Promise<void>;
+        }).markdown;
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        await producer?.({
+          setContent: vi.fn(async (markdown: string) => {
+            visibleProgress.push(markdown);
+          }),
+        });
+      },
+    });
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(message('om_slow_stream', 'run'));
+    await waitFor(() => visibleProgress.some((markdown) => markdown.includes('ANSWER_ONCE')));
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    expect(h.channel.sent).toHaveLength(0);
+  });
+
+  it('renders nothing in a progress stream it already gave up on', async () => {
+    // If the stream is still not producing after the grace window we do reply
+    // without it — but the stream must then stay empty, or the answer shows up
+    // twice as soon as it catches up.
+    const gate = deferred<void>();
+    const setContent = vi.fn(async () => {});
+    const h = await createHarness({
+      agentKind: 'claude',
+      events: [
+        { type: 'text', delta: 'ANSWER_ONCE' },
+        { type: 'done', terminationReason: 'normal' },
+      ],
+      stream: async (_chatId, input) => {
+        const producer = (input as {
+          markdown?: (ctrl: { setContent(markdown: string): Promise<void> }) => Promise<void>;
+        }).markdown;
+        await gate.promise;
+        await producer?.({ setContent });
+      },
+    });
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(message('om_stuck_stream', 'run'));
+    await waitFor(() => h.channel.sent.length === 1, 6000);
+    gate.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    expect(lastMarkdown(h.channel)).toContain('ANSWER_ONCE');
+    expect(h.channel.sent).toHaveLength(1);
+    expect(setContent).not.toHaveBeenCalled();
+  }, 15_000);
 
   it('still sends the final reply when the progress stream fails at completion', async () => {
     const fail = vi.spyOn(log, 'fail').mockImplementation(() => {});
@@ -296,8 +433,11 @@ async function createHarness(options: {
   reactionCreate?: () => Promise<{ data: { reaction_id: string } }>;
   stream?: StreamFn;
   send?: SendFn;
-  events?: readonly AgentEvent[];
+  /** One run's events, or one array per run. */
+  events?: FakeAgentEvents;
   messageReply?: 'card' | 'markdown' | 'text';
+  /** Codex holds its answer back for a dedicated final reply; Claude streams it. */
+  agentKind?: 'claude' | 'codex';
 } = {}): Promise<{
   tmp: TmpProfile;
   channel: FakeLarkChannel;
@@ -310,7 +450,7 @@ async function createHarness(options: {
   const tmp = await createTmpProfile('markdown-stream-startup-failure-');
   const workspace = await realpath(tmp.workspace);
   const baseProfileConfig = createDefaultProfileConfig({
-    agentKind: 'codex',
+    agentKind: options.agentKind ?? 'codex',
     accounts: {
       app: {
         id: 'cli_test',
@@ -338,18 +478,16 @@ async function createHarness(options: {
   const agent = new FakeAgentAdapter({
     id: 'codex',
     displayName: 'Codex',
-    events: options.events
-      ? [options.events]
-      : [
-          [
-            {
-              type: 'error',
-              message: 'codex exited with code 1: Error loading config.toml',
-              terminationReason: 'failed',
-            },
-          ],
-          [{ type: 'done', terminationReason: 'normal' }],
-        ],
+    events: options.events ?? [
+      [
+        {
+          type: 'error',
+          message: 'codex exited with code 1: Error loading config.toml',
+          terminationReason: 'failed',
+        },
+      ],
+      [{ type: 'done', terminationReason: 'normal' }],
+    ],
   });
   const channel = createFakeLarkChannel(options);
   sdkMock.channel = channel;

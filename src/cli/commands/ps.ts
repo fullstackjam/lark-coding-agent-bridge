@@ -1,3 +1,5 @@
+import { SUPERVISOR_SERVICE_ID } from '../../daemon/paths';
+import { getServiceAdapter } from '../../daemon/service-adapter';
 import { readAndPrune, resolveTarget, isAlive } from '../../runtime/registry';
 import type { ProcessEntry } from '../../runtime/registry';
 
@@ -42,6 +44,17 @@ export async function runKillCli(target: string | undefined): Promise<void> {
     console.error('  用 `lark-channel-bridge ps` 看可选目标。');
     process.exit(1);
   }
+  const owner = findOwningService(entry);
+  if (owner) {
+    console.error(
+      `✗ bot ${entry.id} (pid ${entry.pid}) 由 ${owner.platformName} 托管,` +
+        'SIGTERM 之后会被服务管理器立刻重启。',
+    );
+    console.error(`  要停掉它:  ${owner.stopHint}`);
+    console.error(`  只是想重启: ${owner.restartHint}`);
+    process.exit(1);
+  }
+
   console.log(`正在关闭 bot ${entry.id}…`);
   let result: StopProcessEntryResult;
   try {
@@ -56,6 +69,36 @@ export async function runKillCli(target: string | undefined): Promise<void> {
     return;
   }
   console.log(`✓ 已关闭 bot ${entry.id}。`);
+}
+
+/**
+ * Detect that a registry entry IS the process an OS service manager owns.
+ *
+ * launchd (KeepAlive) / systemd (Restart) / Task Scheduler treat a SIGTERM'd
+ * daemon as a crash and respawn it within seconds, on a fresh pid — so a plain
+ * `kill` reports "✓ 已关闭" and the bot is back before the user can blink.
+ * Both service shapes are checked: the machine-wide supervisor (whose pid is
+ * shared by every profile it hosts in-process) and a classic per-profile one.
+ */
+function findOwningService(
+  entry: ProcessEntry,
+): { platformName: string; stopHint: string; restartHint: string } | undefined {
+  const candidates = [
+    { serviceId: SUPERVISOR_SERVICE_ID, flag: '--web-ui' },
+    { serviceId: entry.profileName, flag: `--profile ${entry.profileName}` },
+  ];
+  for (const { serviceId, flag } of candidates) {
+    const adapter = getServiceAdapter(serviceId);
+    if (!adapter?.fileExists() || !adapter.isRunning()) continue;
+    const { pid } = adapter.parseStatus(adapter.describeStatus());
+    if (!pid || Number(pid) !== entry.pid) continue;
+    return {
+      platformName: adapter.platformName,
+      stopHint: `lark-channel-bridge stop ${flag}`,
+      restartHint: `lark-channel-bridge restart ${flag}`,
+    };
+  }
+  return undefined;
 }
 
 export type StopProcessEntryResult = 'terminated' | 'killed';

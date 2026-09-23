@@ -45,10 +45,10 @@ describe('buildBridgeSystemPrompt', () => {
   });
 
   it('appends a concrete identity line with open_id and name', () => {
-    const prompt = buildBridgeSystemPrompt({ openId: 'ou_bot_self', name: '尼莫' });
+    const prompt = buildBridgeSystemPrompt({ openId: 'ou_bot_self', name: '助手' });
     expect(prompt.startsWith(BRIDGE_SYSTEM_PROMPT)).toBe(true);
     expect(prompt).toContain('ou_bot_self');
-    expect(prompt).toContain('尼莫');
+    expect(prompt).toContain('助手');
   });
 
   it('appends the identity line even when the bot name is missing', () => {

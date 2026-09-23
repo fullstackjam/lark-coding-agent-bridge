@@ -49,6 +49,7 @@ type StoredProfileConfig = Pick<
   ProfileConfig,
   | 'schemaVersion'
   | 'agentKind'
+  | 'mode'
   | 'accounts'
   | 'secrets'
   | 'preferences'
@@ -59,6 +60,7 @@ type StoredProfileConfig = Pick<
   | 'codex'
   | 'attachments'
   | 'comments'
+  | 'meeting'
   | 'larkCli'
 >;
 
@@ -87,6 +89,7 @@ function serializeProfileConfig(profile: ProfileConfig): StoredProfileConfig {
   return {
     schemaVersion: profile.schemaVersion,
     agentKind: profile.agentKind,
+    mode: profile.mode,
     accounts: profile.accounts,
     ...(profile.secrets ? { secrets: profile.secrets } : {}),
     preferences: profile.preferences,
@@ -97,6 +100,7 @@ function serializeProfileConfig(profile: ProfileConfig): StoredProfileConfig {
     ...(profile.codex ? { codex: profile.codex } : {}),
     attachments: profile.attachments,
     comments: {},
+    meeting: profile.meeting,
     larkCli: profile.larkCli,
   };
 }
