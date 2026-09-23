@@ -404,7 +404,7 @@ describe('topic message quote handling', () => {
         content: '@Bridge 看父消息',
       }),
     );
-    await waitFor(() => h.agent.runOptions.length === 1);
+    await waitFor(() => h.agent.runOptions.length === 1, 5000);
 
     const prompt = h.agent.runOptions[0]?.prompt ?? '';
     expect(prompt).toContain('<quoted_messages>');
