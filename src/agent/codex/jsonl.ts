@@ -175,6 +175,12 @@ export class CodexJsonlTranslator {
   }
 
   private queueAgentMessage(message: string): AgentEvent[] {
+    // Codex announces the same message in more than one shape across versions
+    // (a raw `agent_message` event and a completed `agent_message` item). A
+    // build that emits both would otherwise stream the first copy as progress
+    // commentary and then deliver the second as the final answer — the same
+    // words twice. An identical repeat is the same message, not a new one.
+    if (message === this.pendingAgentMessage) return [];
     const events = this.pendingAgentMessage
       ? [{ type: 'text' as const, delta: this.pendingAgentMessage }]
       : [];

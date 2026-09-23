@@ -88,6 +88,7 @@ class WakeUpCapableFakeAgent implements AgentAdapter {
   readonly id = 'fake-wake';
   readonly displayName = 'Fake Wake Agent';
   readonly runOptions: AgentRunOptions[] = [];
+  spontaneousTurnCalls = 0;
   private pendingResolve: ((run: AgentRun | null) => void) | null = null;
   private queued: AgentRun[] = [];
   closeSessionCalls: string[] = [];
@@ -105,6 +106,7 @@ class WakeUpCapableFakeAgent implements AgentAdapter {
 
   // WakeUpCapableAdapter (duck-typed by channel.ts)
   async nextSpontaneousTurn(_scopeId: string): Promise<AgentRun | null> {
+    this.spontaneousTurnCalls++;
     const queued = this.queued.shift();
     if (queued) return queued;
     return new Promise<AgentRun | null>((resolve) => {
@@ -352,8 +354,9 @@ describe('wake-up card rendering through channel.ts', () => {
     // 1) Owner sends a normal message in the workbench group → first run.
     h.channel.handlers.message?.(message({ content: 'hi' }));
     await waitFor(() => h.agent.runOptions.length >= 1);
-    // Drain the user run's events so the watcher loop picks up.
-    await waitFor(() => h.channel.streamCalls.length >= 1);
+    // A terminal-only user turn no longer opens an empty progress card.
+    // Wait for the watcher itself, not a user stream.
+    await waitFor(() => h.agent.spontaneousTurnCalls >= 1);
     const userCardCalls = h.channel.streamCalls.length;
 
     // 2) Simulate oh-my-openagent's wake-up via the duck-typed
@@ -386,7 +389,7 @@ describe('wake-up card rendering through channel.ts', () => {
     // First user run kicks off the watcher.
     h.channel.handlers.message?.(message({ content: 'hi' }));
     await waitFor(() => h.agent.runOptions.length >= 1);
-    await waitFor(() => h.channel.streamCalls.length >= 1);
+    await waitFor(() => h.agent.spontaneousTurnCalls >= 1);
     const before = h.channel.streamCalls.length;
 
     // Resolve the pending nextSpontaneousTurn with null (mirrors

@@ -52,13 +52,14 @@ vi.mock('../../../src/config/paths', () => ({
 vi.mock('../../../src/daemon/paths', () => ({
   daemonStdoutPath: (profile: string) => `/tmp/lark-channel-home/profiles/${profile}/logs/daemon/stdout.log`,
   daemonStderrPath: (profile: string) => `/tmp/lark-channel-home/profiles/${profile}/logs/daemon/stderr.log`,
+  SUPERVISOR_SERVICE_ID: 'supervisor',
 }));
 
 vi.mock('../../../src/cli/preflight', () => ({
   preFlightChecks: mocks.preFlightChecks,
 }));
 
-const { runServiceStart, runServiceStatus, runServiceUnregister } = await import('../../../src/cli/commands/service');
+const { runServiceStart, runServiceStatus, runServiceStop, runServiceUnregister } = await import('../../../src/cli/commands/service');
 
 describe('profile-aware service commands', () => {
   beforeEach(() => {
@@ -72,6 +73,7 @@ describe('profile-aware service commands', () => {
       start: vi.fn(() => ({ ok: true, stderr: '' })),
       stop: vi.fn(() => ({ ok: true, stderr: '' })),
       stopAndDisableAutostart: vi.fn(() => ({ ok: true, stderr: '' })),
+      disableAutostart: vi.fn(() => ({ ok: true, stderr: '' })),
       restart: vi.fn(() => ({ ok: true, stderr: '' })),
       waitUntilStopped: vi.fn(async () => true),
       deleteFile: vi.fn(async () => {}),
@@ -132,7 +134,8 @@ describe('profile-aware service commands', () => {
 
     await runServiceStart({ profile: 'codex-dev', skipCheckLarkCli: true });
 
-    expect(mocks.getServiceAdapter).toHaveBeenCalledWith('codex-dev');
+    // Classic per-profile service pins `run --profile <profile>`.
+    expect(mocks.getServiceAdapter).toHaveBeenCalledWith('codex-dev', ['run', '--profile', 'codex-dev']);
     expect(mocks.resolveProfileRuntime).toHaveBeenNthCalledWith(1, expect.objectContaining({
       profile: 'codex-dev',
       agent: undefined,
@@ -467,7 +470,7 @@ describe('profile-aware service commands', () => {
       profile: 'claude',
       allowBootstrap: false,
     });
-    expect(mocks.getServiceAdapter).toHaveBeenCalledWith('claude');
+    expect(mocks.getServiceAdapter).toHaveBeenCalledWith('claude', ['run', '--profile', 'claude']);
     expect(mocks.materializeEnvSecretForService).toHaveBeenCalledWith({ profile: 'claude' });
     expect(mocks.adapter.install).toHaveBeenCalled();
     expect(mocks.adapter.start).toHaveBeenCalled();
@@ -478,11 +481,70 @@ describe('profile-aware service commands', () => {
     (mocks.adapter.fileExists as ReturnType<typeof vi.fn>).mockReturnValue(false);
 
     await runServiceStatus();
-    expect(mocks.getServiceAdapter).toHaveBeenCalledWith('codex-dev');
+    // Lifecycle commands (status/stop/restart/unregister) don't install, so
+    // they pass no runArgs.
+    expect(mocks.getServiceAdapter).toHaveBeenCalledWith('codex-dev', undefined);
 
     mocks.readActiveProfile.mockResolvedValue(undefined);
     mocks.loadRootConfig.mockResolvedValue(undefined);
     await expect(runServiceStatus()).rejects.toThrow('active profile is required');
+  });
+
+  it('falls back to the supervisor service when the active profile has no service of its own', async () => {
+    const lines: string[] = [];
+    vi.spyOn(console, 'log').mockImplementation((line: string) => {
+      lines.push(line);
+    });
+    // Machine installed via `start --web-ui`: only the supervisor service
+    // exists on disk, and it is the process hosting profile codex-dev.
+    const supervisor = { ...mocks.adapter, isRunning: vi.fn(() => true) } as ServiceAdapter;
+    mocks.getServiceAdapter.mockImplementation((serviceId: string) =>
+      serviceId === 'supervisor'
+        ? supervisor
+        : { ...mocks.adapter, fileExists: vi.fn(() => false) },
+    );
+    mocks.readAndPrune.mockReturnValue([]);
+
+    await runServiceStop();
+
+    // Must act on the supervisor service, not silently no-op on a
+    // per-profile service that was never installed.
+    expect(supervisor.stopAndDisableAutostart).toHaveBeenCalled();
+    expect(lines.join('\n')).toContain('已指向控制面 supervisor 服务');
+    expect(lines).toContain('✓ 控制面 supervisor 已停止运行');
+  });
+
+  it('turns off autostart when stopping a registered-but-not-running service', async () => {
+    const lines: string[] = [];
+    vi.spyOn(console, 'log').mockImplementation((line: string) => {
+      lines.push(line);
+    });
+
+    // fileExists=true, isRunning=false — nothing to kill, but the login-time
+    // autostart is still armed and would bring the daemon back by itself.
+    await runServiceStop({ profile: 'codex-dev' });
+
+    expect(mocks.adapter.disableAutostart).toHaveBeenCalled();
+    expect(mocks.adapter.stopAndDisableAutostart).not.toHaveBeenCalled();
+    expect(lines).toContain('  已关闭开机自启。');
+  });
+
+  it('leaves an explicit --profile target alone even when a supervisor service exists', async () => {
+    const lines: string[] = [];
+    vi.spyOn(console, 'log').mockImplementation((line: string) => {
+      lines.push(line);
+    });
+    const supervisor = { ...mocks.adapter, isRunning: vi.fn(() => true) } as ServiceAdapter;
+    const classic = { ...mocks.adapter, fileExists: vi.fn(() => false) } as ServiceAdapter;
+    mocks.getServiceAdapter.mockImplementation((serviceId: string) =>
+      serviceId === 'supervisor' ? supervisor : classic,
+    );
+
+    await runServiceStop({ profile: 'codex-dev' });
+
+    expect(supervisor.stopAndDisableAutostart).not.toHaveBeenCalled();
+    expect(classic.stopAndDisableAutostart).not.toHaveBeenCalled();
+    expect(lines).toContain('bot 还没在后台运行过,无需停止。');
   });
 
   it('allows cleanup of an explicitly named service after its profile was removed', async () => {
@@ -499,7 +561,7 @@ describe('profile-aware service commands', () => {
     await runServiceStatus({ profile: 'codex-dev' });
     await runServiceUnregister({ profile: 'codex-dev' });
 
-    expect(mocks.getServiceAdapter).toHaveBeenCalledWith('codex-dev');
+    expect(mocks.getServiceAdapter).toHaveBeenCalledWith('codex-dev', undefined);
     expect(mocks.adapter.deleteFile).toHaveBeenCalled();
     expect(lines).toContain('✓ 已清除后台运行注册');
     expect(lines).toContain('  (配置 / 日志 / 会话保留在 /tmp/lark-channel-home)');
